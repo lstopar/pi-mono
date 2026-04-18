@@ -1,5 +1,5 @@
 import { marked, type Token } from "marked";
-import { isImageLine } from "../terminal-image.js";
+import { getCapabilities, isImageLine } from "../terminal-image.js";
 import type { Component } from "../tui.js";
 import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 
@@ -469,11 +469,20 @@ export class Markdown implements Component {
 					// For mailto: links, strip the prefix before comparing (autolinked emails have
 					// text="foo@bar.com" but href="mailto:foo@bar.com")
 					const hrefForComparison = token.href.startsWith("mailto:") ? token.href.slice(7) : token.href;
+
+					// OSC 8 hyperlinks: \x1b]8;;URL\x1b\\ TEXT \x1b]8;;\x1b\\
+					// Only emit when the terminal supports it; degrades gracefully to plain text.
+					const osc8 = getCapabilities().hyperlinks;
+					const hrefOpen = osc8 ? `\x1b]8;;${token.href}\x1b\\` : "";
+					const hrefClose = osc8 ? `\x1b]8;;\x1b\\` : "";
+
 					if (token.text === token.href || token.text === hrefForComparison) {
-						result += this.theme.link(this.theme.underline(linkText)) + stylePrefix;
+						result += hrefOpen + this.theme.link(this.theme.underline(linkText)) + hrefClose + stylePrefix;
 					} else {
 						result +=
+							hrefOpen +
 							this.theme.link(this.theme.underline(linkText)) +
+							hrefClose +
 							this.theme.linkUrl(` (${token.href})`) +
 							stylePrefix;
 					}

@@ -158,6 +158,27 @@ export interface SessionTreeNode {
 	labelTimestamp?: string;
 }
 
+/** Virtual root grouping entries from one session file (for merged tree view). */
+export interface MergedSessionRoot {
+	/** Session file path */
+	sessionFile: string;
+	/** Session display name (from session_info or timestamp fallback) */
+	label: string;
+	/** Timestamp of session creation */
+	created: Date;
+	/** Whether this is the currently active session */
+	isCurrent: boolean;
+	/** Tree roots from this session */
+	tree: SessionTreeNode[];
+}
+
+/** Result of merging trees from multiple session files in the same directory. */
+export interface MergedTree {
+	sessions: MergedSessionRoot[];
+	/** Entry ID → session file path (for lookup on select) */
+	entrySessionMap: Map<string, string>;
+}
+
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
@@ -1417,4 +1438,67 @@ export class SessionManager {
 			return [];
 		}
 	}
+}
+
+/**
+ * Build a tree structure from raw session entries, optionally resolving labels.
+ *
+ * This is a standalone version of `SessionManager.getTree()` that works on
+ * plain entry arrays (e.g. loaded from a .jsonl file via `loadEntriesFromFile`).
+ * Labels are resolved from `LabelEntry` entries within the array.
+ *
+ * @param entries - Session entries (accepts `FileEntry[]` for convenience;
+ *   header entries are skipped automatically).
+ * @returns Tree roots (each node has `entry`, `children`, and optional `label`/`labelTimestamp`).
+ */
+export function buildTreeFromEntries(entries: FileEntry[]): SessionTreeNode[] {
+	const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");
+
+	// Build labels map from LabelEntry entries
+	const labelsById = new Map<string, string>();
+	const labelTimestampsById = new Map<string, string>();
+	for (const entry of sessionEntries) {
+		if (entry.type === "label") {
+			if (entry.label) {
+				labelsById.set(entry.targetId, entry.label);
+				labelTimestampsById.set(entry.targetId, entry.timestamp);
+			} else {
+				labelsById.delete(entry.targetId);
+				labelTimestampsById.delete(entry.targetId);
+			}
+		}
+	}
+
+	const nodeMap = new Map<string, SessionTreeNode>();
+	const roots: SessionTreeNode[] = [];
+
+	for (const entry of sessionEntries) {
+		const label = labelsById.get(entry.id);
+		const labelTimestamp = labelTimestampsById.get(entry.id);
+		nodeMap.set(entry.id, { entry, children: [], label, labelTimestamp });
+	}
+
+	for (const entry of sessionEntries) {
+		const node = nodeMap.get(entry.id)!;
+		if (entry.parentId === null || entry.parentId === entry.id) {
+			roots.push(node);
+		} else {
+			const parent = nodeMap.get(entry.parentId);
+			if (parent) {
+				parent.children.push(node);
+			} else {
+				roots.push(node);
+			}
+		}
+	}
+
+	// Sort children by timestamp (oldest first)
+	const stack: SessionTreeNode[] = [...roots];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		node.children.sort((a, b) => new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime());
+		stack.push(...node.children);
+	}
+
+	return roots;
 }
