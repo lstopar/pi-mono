@@ -55,6 +55,8 @@ export interface CreateAgentSessionFromServicesOptions {
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	tools?: Tool[];
 	customTools?: ToolDefinition[];
+	/** Path to log raw LLM request payloads (JSONL). When set, each provider request is appended. */
+	logPrompts?: string;
 }
 
 /**
@@ -193,5 +195,6 @@ export async function createAgentSessionFromServices(
 		tools: options.tools,
 		customTools: options.customTools,
 		sessionStartEvent: options.sessionStartEvent,
+		logPrompts: options.logPrompts,
 	});
 }

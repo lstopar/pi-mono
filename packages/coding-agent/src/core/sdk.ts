@@ -1,7 +1,35 @@
+import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { type Message, type Model, streamSimple } from "@mariozechner/pi-ai";
 import { getAgentDir, getDocsPath } from "../config.js";
+
+/** Format message content (string or content block array) into readable lines. */
+function formatContent(content: unknown, lines: string[]): void {
+	if (typeof content === "string") {
+		lines.push(content);
+	} else if (Array.isArray(content)) {
+		for (const block of content) {
+			const b = block as Record<string, unknown>;
+			if (typeof b.text === "string") {
+				lines.push(b.text);
+			} else if (b.type === "image" || b.type === "image_url") {
+				const url = (b.source as Record<string, unknown>)?.url ?? (b.image_url as Record<string, unknown>)?.url;
+				lines.push(`[image: ${typeof url === "string" ? url.slice(0, 80) : "embedded"}]`);
+			} else if (b.type === "tool_use" || b.type === "function_call") {
+				lines.push(`[tool call: ${b.name ?? (b.function as Record<string, unknown>)?.name ?? "unknown"}]`);
+				if (b.input != null) lines.push(JSON.stringify(b.input, null, 2));
+			} else if (b.type === "tool_result" || b.type === "function_call_output") {
+				lines.push(`[tool result: ${b.tool_use_id ?? ""}]`);
+				if (typeof b.content === "string") lines.push(b.content);
+				else if (Array.isArray(b.content)) formatContent(b.content, lines);
+			} else if (b.type === "thinking") {
+				if (typeof b.thinking === "string") lines.push(`[thinking]\n${b.thinking}`);
+			}
+		}
+	}
+}
+
 import { AgentSession } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
@@ -72,6 +100,8 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Path to log raw LLM request payloads (JSONL). When set, each provider request is appended. */
+	logPrompts?: string;
 }
 
 /** Result from createAgentSession */
@@ -288,6 +318,79 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
+	// Build the onPayload callback that optionally logs requests to a file
+	const logPromptsPath = options.logPrompts;
+	const logPayload = logPromptsPath
+		? (payload: unknown, model: Model<any>) => {
+				const lines: string[] = [];
+				const p = payload as Record<string, unknown>;
+				lines.push("\n" + "=".repeat(80));
+				lines.push(`[${new Date().toISOString()}] ${model.provider}/${model.id}`);
+				lines.push("=".repeat(80));
+				lines.push("");
+
+				// System prompt
+				const system = p.system ?? p.systemInstruction;
+				if (typeof system === "string") {
+					lines.push("## System Prompt");
+					lines.push("");
+					lines.push(system);
+					lines.push("");
+				} else if (Array.isArray(system)) {
+					const texts = system
+						.filter((b: Record<string, unknown>) => b.type === "text" && typeof b.text === "string")
+						.map((b: Record<string, unknown>) => (b as { text: string }).text);
+					if (texts.length > 0) {
+						lines.push("## System Prompt");
+						lines.push("");
+						lines.push(...texts);
+						lines.push("");
+					}
+				}
+
+				// Messages
+				const messages = p.messages ?? p.contents;
+				if (Array.isArray(messages)) {
+					lines.push("## Messages");
+					lines.push("");
+					for (const msg of messages) {
+						const m = msg as Record<string, unknown>;
+						const role = typeof m.role === "string" ? m.role : "unknown";
+						lines.push(`### ${role}`);
+						lines.push("");
+						formatContent(m.content, lines);
+						lines.push("");
+					}
+				}
+
+				// Tools
+				if (Array.isArray(p.tools)) {
+					lines.push("## Tools");
+					lines.push("");
+					for (const tool of p.tools) {
+						const t = tool as Record<string, unknown>;
+						const fn = (t.function ?? t) as Record<string, unknown>;
+						lines.push(`- \`${fn.name ?? t.name ?? "unknown"}\``);
+					}
+					lines.push("");
+				}
+
+				// Other params
+				const skip = new Set(["system", "systemInstruction", "messages", "contents", "tools"]);
+				const other = Object.entries(p).filter(([k]) => !skip.has(k));
+				if (other.length > 0) {
+					lines.push("## Parameters");
+					lines.push("");
+					for (const [key, value] of other) {
+						lines.push(`- **${key}**: ${JSON.stringify(value)}`);
+					}
+					lines.push("");
+				}
+
+				appendFileSync(logPromptsPath, lines.join("\n") + "\n");
+			}
+		: undefined;
+
 	agent = new Agent({
 		initialState: {
 			systemPrompt: "",
@@ -307,7 +410,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 			});
 		},
-		onPayload: async (payload, _model) => {
+		onPayload: async (payload, model) => {
+			logPayload?.(payload, model);
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {
 				return payload;
