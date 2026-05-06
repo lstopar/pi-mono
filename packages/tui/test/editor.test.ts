@@ -374,6 +374,22 @@ describe("Editor component", () => {
 
 			assert.strictEqual(editor.getText(), "");
 		});
+
+		it("inserts shifted CSI-u letters as text", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+
+			editor.handleInput("\x1b[69;2u");
+
+			assert.strictEqual(editor.getText(), "E");
+		});
+
+		it("inserts shifted xterm modifyOtherKeys letters as text", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+
+			editor.handleInput("\x1b[27;2;69~");
+
+			assert.strictEqual(editor.getText(), "E");
+		});
 	});
 
 	describe("Unicode text editing behavior", () => {
@@ -607,6 +623,18 @@ describe("Editor component", () => {
 			for (let i = 1; i < lines.length - 1; i++) {
 				const lineWidth = visibleWidth(lines[i]!);
 				assert.strictEqual(lineWidth, width, `Line ${i} has width ${lineWidth}, expected ${width}`);
+			}
+		});
+
+		it("renders isolated Thai and Lao AM clusters without width drift", () => {
+			for (const text of ["ำabc", "ຳabc"]) {
+				const editor = new Editor(createTestTUI(), defaultEditorTheme);
+				const width = 8;
+				editor.setText(text);
+
+				for (const line of editor.render(width)) {
+					assert.strictEqual(visibleWidth(line), width, `line width drift for ${JSON.stringify(text)}: ${line}`);
+				}
 			}
 		});
 
@@ -1661,6 +1689,16 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.isShowingAutocomplete(), false);
 		});
 
+		it("decodes CSI-u Ctrl+letter sequences inside bracketed paste (tmux popup)", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+
+			// tmux popups with extended-keys-format=csi-u re-encode \n in pastes as
+			// \x1b[106;5u (Ctrl+J). Without decoding, the per-char filter strips ESC
+			// and leaks "[106;5u" between lines. See issue #3599.
+			editor.handleInput("\x1b[200~line1\x1b[106;5uline2\x1b[106;5uline3\x1b[201~");
+			assert.strictEqual(editor.getText(), "line1\nline2\nline3");
+		});
+
 		it("undoes multi-line paste atomically", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 
@@ -2116,6 +2154,39 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.isShowingAutocomplete(), true);
 		});
 
+		it("debounces # autocomplete while typing", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			let suggestionCalls = 0;
+
+			const mockProvider: AutocompleteProvider = {
+				getSuggestions: async (lines, _cursorLine, cursorCol) => {
+					suggestionCalls += 1;
+					const text = (lines[0] || "").slice(0, cursorCol);
+					return {
+						items: [{ value: "#2983", label: "#2983" }],
+						prefix: text,
+					};
+				},
+				applyCompletion,
+			};
+
+			editor.setAutocompleteProvider(mockProvider);
+
+			editor.handleInput("#");
+			editor.handleInput("2");
+			editor.handleInput("9");
+			editor.handleInput("8");
+
+			assert.strictEqual(suggestionCalls, 0);
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			await flushAutocomplete();
+
+			assert.strictEqual(suggestionCalls, 1);
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+		});
+
 		it("aborts active @ autocomplete when typing continues", async () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 			let aborts = 0;
@@ -2460,14 +2531,17 @@ describe("Editor component", () => {
 
 		it("awaits async slash command argument completions", async () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
-			const provider = new CombinedAutocompleteProvider([
-				{
-					name: "load-skills",
-					description: "Load skills",
-					getArgumentCompletions: async (prefix) =>
-						prefix.startsWith("s") ? [{ value: "skill-a", label: "skill-a" }] : null,
-				},
-			]);
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{
+						name: "load-skills",
+						description: "Load skills",
+						getArgumentCompletions: async (prefix) =>
+							prefix.startsWith("s") ? [{ value: "skill-a", label: "skill-a" }] : null,
+					},
+				],
+				process.cwd(),
+			);
 			editor.setAutocompleteProvider(provider);
 			editor.setText("/load-skills ");
 
@@ -2482,15 +2556,18 @@ describe("Editor component", () => {
 
 		it("ignores invalid slash command argument completion results", async () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
-			const provider = new CombinedAutocompleteProvider([
-				{
-					name: "load-skills",
-					description: "Load skills",
-					getArgumentCompletions: (() => "not-an-array") as unknown as (
-						argumentPrefix: string,
-					) => Promise<{ value: string; label: string }[] | null>,
-				},
-			]);
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{
+						name: "load-skills",
+						description: "Load skills",
+						getArgumentCompletions: (() => "not-an-array") as unknown as (
+							argumentPrefix: string,
+						) => Promise<{ value: string; label: string }[] | null>,
+					},
+				],
+				process.cwd(),
+			);
 			editor.setAutocompleteProvider(provider);
 			editor.setText("/load-skills ");
 
@@ -2502,14 +2579,17 @@ describe("Editor component", () => {
 
 		it("does not show argument completions when command has no argument completer", async () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
-			const provider = new CombinedAutocompleteProvider([
-				{ name: "help", description: "Show help" },
-				{
-					name: "model",
-					description: "Switch model",
-					getArgumentCompletions: () => [{ value: "claude-opus", label: "claude-opus" }],
-				},
-			]);
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{ name: "help", description: "Show help" },
+					{
+						name: "model",
+						description: "Switch model",
+						getArgumentCompletions: () => [{ value: "claude-opus", label: "claude-opus" }],
+					},
+				],
+				process.cwd(),
+			);
 			editor.setAutocompleteProvider(provider);
 
 			editor.handleInput("/");

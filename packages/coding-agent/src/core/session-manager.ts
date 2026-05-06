@@ -15,6 +15,7 @@ import {
 } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
 import { join, resolve } from "path";
+import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import {
 	type BashExecutionMessage,
@@ -217,6 +218,10 @@ export type ReadonlySessionManager = Pick<
 	| "getTree"
 	| "getSessionName"
 >;
+
+function createSessionId(): string {
+	return uuidv7();
+}
 
 /** Generate a unique short ID (8 hex chars, collision-checked) */
 function generateId(byId: { has(id: string): boolean }): string {
@@ -728,7 +733,7 @@ export class SessionManager {
 			}
 
 			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
-			this.sessionId = header?.id ?? randomUUID();
+			this.sessionId = header?.id ?? createSessionId();
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
 				this._rewriteFile();
@@ -744,7 +749,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
-		this.sessionId = options?.id ?? randomUUID();
+		this.sessionId = options?.id ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const header: SessionHeader = {
 			type: "session",
@@ -1193,7 +1198,7 @@ export class SessionManager {
 		// Filter out LabelEntry from path - we'll recreate them from the resolved map
 		const pathWithoutLabels = path.filter((e) => e.type !== "label");
 
-		const newSessionId = randomUUID();
+		const newSessionId = createSessionId();
 		const timestamp = new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 		const newSessionFile = join(this.getSessionDir(), `${fileTimestamp}_${newSessionId}.jsonl`);
@@ -1346,7 +1351,7 @@ export class SessionManager {
 		}
 
 		// Create new session file with new ID but forked content
-		const newSessionId = randomUUID();
+		const newSessionId = createSessionId();
 		const timestamp = new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 		const newSessionFile = join(dir, `${fileTimestamp}_${newSessionId}.jsonl`);

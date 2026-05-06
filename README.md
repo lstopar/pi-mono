@@ -1,18 +1,10 @@
-<!-- OSS_WEEKEND_START -->
-# 🏖️ OSS Weekend
-
-**Issue tracker reopens Monday, April 13, 2026.**
-
-OSS weekend runs Thursday, April 2, 2026 through Monday, April 13, 2026. New issues and PRs from unapproved contributors are auto-closed during this time. Approved contributors can still open issues and PRs if something is genuinely urgent, but please keep that to pressing matters only. For support, join [Discord](https://discord.com/invite/3cU7Bz4UPx).
-
-> _Current focus: at the moment i'm deep in refactoring internals, and need to focus._
-<!-- OSS_WEEKEND_END -->
-
----
-
 <p align="center">
-  <a href="https://shittycodingagent.ai">
-    <img src="https://shittycodingagent.ai/logo.svg" alt="pi logo" width="128">
+  <a href="https://pi.dev">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://pi.dev/logo.svg">
+      <source media="(prefers-color-scheme: light)" srcset="https://huggingface.co/buckets/julien-c/my-training-bucket/resolve/pi-logo-dark.svg">
+      <img alt="pi logo" src="https://pi.dev/logo.svg" width="128">
+    </picture>
   </a>
 </p>
 <p align="center">
@@ -25,11 +17,15 @@ OSS weekend runs Thursday, April 2, 2026 through Monday, April 13, 2026. New iss
   <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
 </p>
 
+> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
 # Pi Monorepo
 
 > **Looking for the pi coding agent?** See **[packages/coding-agent](packages/coding-agent)** for installation and usage.
 
-Tools for building AI agents and managing LLM deployments.
+Tools for building AI agents.
 
 ## Share your OSS coding agent sessions
 
@@ -54,10 +50,12 @@ I regularly publish my own `pi-mono` work sessions here:
 | **[@mariozechner/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
 | **[@mariozechner/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
 | **[@mariozechner/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
-| **[@mariozechner/pi-mom](packages/mom)** | Slack bot that delegates messages to the pi coding agent |
 | **[@mariozechner/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
 | **[@mariozechner/pi-web-ui](packages/web-ui)** | Web components for AI chat interfaces |
-| **[@mariozechner/pi-pods](packages/pods)** | CLI for managing vLLM deployments on GPU pods |
+
+## Chat bot workflows
+
+For Slack/chat automation, see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
 
 ## Contributing
 
