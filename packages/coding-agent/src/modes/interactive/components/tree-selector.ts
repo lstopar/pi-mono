@@ -9,31 +9,10 @@ import {
 	TruncatedText,
 	truncateToWidth,
 } from "@mariozechner/pi-tui";
-import type { SessionInfoEntry, SessionTreeNode } from "../../../core/session-manager.js";
+import type { SessionTreeNode } from "../../../core/session-manager.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint, keyText } from "./keybinding-hints.js";
-
-/** Virtual root grouping entries from one session file. */
-export interface MergedSessionRoot {
-	/** Session file path */
-	sessionFile: string;
-	/** Session display name (from session_info or timestamp fallback) */
-	label: string;
-	/** Timestamp of session creation */
-	created: Date;
-	/** Whether this is the currently active session */
-	isCurrent: boolean;
-	/** Tree roots from this session */
-	tree: SessionTreeNode[];
-}
-
-/** Result of merging trees from multiple session files. */
-export interface MergedTree {
-	sessions: MergedSessionRoot[];
-	/** Entry ID → session file path (for lookup on select) */
-	entrySessionMap: Map<string, string>;
-}
 
 /** Gutter info: position (displayIndent where connector was) and whether to show │ */
 interface GutterInfo {
@@ -54,14 +33,6 @@ interface FlatNode {
 	gutters: GutterInfo[];
 	/** True if this node is a root under a virtual branching root (multiple roots) */
 	isVirtualRootChild: boolean;
-
-	// Session header fields (set when this is a synthetic session header node)
-	/** If set, this is a session header divider (non-selectable, rendered as styled divider) */
-	isSessionHeader?: boolean;
-	/** Display label for the session header */
-	sessionHeaderLabel?: string;
-	/** Whether this session header represents the current session */
-	sessionHeaderIsCurrent?: boolean;
 }
 
 /** Filter mode for tree display */
@@ -98,7 +69,7 @@ class TreeList implements Component {
 	public onLabelEdit?: (entryId: string, currentLabel: string | undefined) => void;
 
 	constructor(
-		treeOrMerged: SessionTreeNode[] | MergedTree,
+		tree: SessionTreeNode[],
 		currentLeafId: string | null,
 		maxVisibleLines: number,
 		initialSelectedId?: string,
@@ -107,51 +78,8 @@ class TreeList implements Component {
 		this.currentLeafId = currentLeafId;
 		this.maxVisibleLines = maxVisibleLines;
 		this.filterMode = initialFilterMode ?? "default";
-
-		if (!Array.isArray(treeOrMerged) && "sessions" in treeOrMerged) {
-			// MergedTree mode: interleave session header nodes between sessions
-			const merged = treeOrMerged as MergedTree;
-			this.multipleRoots = merged.sessions.length > 1;
-			this.flatNodes = [];
-
-			for (const session of merged.sessions) {
-				// Create a synthetic session header node
-				const headerId = `__session_${session.sessionFile.replace(/[^a-zA-Z0-9]/g, "_")}`;
-				const headerEntry: SessionInfoEntry = {
-					type: "session_info",
-					id: headerId,
-					parentId: null,
-					timestamp: session.created.toISOString(),
-					name: session.label,
-				};
-				const headerNode: SessionTreeNode = {
-					entry: headerEntry,
-					children: [],
-				};
-
-				this.flatNodes.push({
-					node: headerNode,
-					indent: 0,
-					showConnector: false,
-					isLast: false,
-					gutters: [],
-					isVirtualRootChild: false,
-					isSessionHeader: true,
-					sessionHeaderLabel: session.label,
-					sessionHeaderIsCurrent: session.isCurrent,
-				});
-
-				// Add session's tree entries
-				const sessionNodes = this.flattenTree(session.tree);
-				this.flatNodes.push(...sessionNodes);
-			}
-		} else {
-			// Existing behavior: plain tree
-			const tree = treeOrMerged as SessionTreeNode[];
-			this.multipleRoots = tree.length > 1;
-			this.flatNodes = this.flattenTree(tree);
-		}
-
+		this.multipleRoots = tree.length > 1;
+		this.flatNodes = this.flattenTree(tree);
 		this.buildActivePath();
 		this.applyFilter();
 
@@ -352,9 +280,6 @@ class TreeList implements Component {
 		const searchTokens = this.searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
 
 		this.filteredNodes = this.flatNodes.filter((flatNode) => {
-			// Session headers always pass the filter
-			if (flatNode.isSessionHeader) return true;
-
 			const entry = flatNode.node.entry;
 			const isCurrentLeaf = entry.id === this.currentLeafId;
 
@@ -694,20 +619,6 @@ class TreeList implements Component {
 
 		for (let i = startIndex; i < endIndex; i++) {
 			const flatNode = this.filteredNodes[i];
-
-			// Session header: render as styled divider
-			if (flatNode.isSessionHeader) {
-				const label = flatNode.sessionHeaderLabel ?? "Session";
-				const tag = flatNode.sessionHeaderIsCurrent ? " (current)" : "";
-				const header = theme.fg("borderAccent", `── ${label}${tag} `);
-				// Pad with dashes to fill width
-				const usedLen = 4 + label.length + tag.length + 1; // "── " + label + tag + " "
-				const dashCount = Math.max(0, Math.floor((width - usedLen) / 2));
-				const dashes = theme.fg("borderAccent", "─".repeat(dashCount));
-				lines.push(truncateToWidth(`${dashes}${header}${dashes}`, width));
-				continue;
-			}
-
 			const entry = flatNode.node.entry;
 			const isSelected = i === this.selectedIndex;
 
@@ -908,6 +819,11 @@ class TreeList implements Component {
 					result += (c as { text: string }).text;
 					if (result.length >= maxLen) return result.slice(0, maxLen);
 				}
+				if (typeof c === "object" && c !== null && "type" in c && c.type === "providerNative") {
+					const subtype = (c as { subtype?: string }).subtype ?? "unknown";
+					result += `[providerNative:${subtype}]`;
+					if (result.length >= maxLen) return result.slice(0, maxLen);
+				}
 			}
 			return result;
 		}
@@ -921,6 +837,9 @@ class TreeList implements Component {
 				if (typeof c === "object" && c !== null && "type" in c && c.type === "text") {
 					const text = (c as { text?: string }).text;
 					if (text && text.trim().length > 0) return true;
+				}
+				if (typeof c === "object" && c !== null && "type" in c && c.type === "providerNative") {
+					return true;
 				}
 			}
 		}
@@ -988,13 +907,9 @@ class TreeList implements Component {
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
 		if (kb.matches(keyData, "tui.select.up")) {
-			do {
-				this.selectedIndex = this.selectedIndex === 0 ? this.filteredNodes.length - 1 : this.selectedIndex - 1;
-			} while (this.filteredNodes[this.selectedIndex]?.isSessionHeader);
+			this.selectedIndex = this.selectedIndex === 0 ? this.filteredNodes.length - 1 : this.selectedIndex - 1;
 		} else if (kb.matches(keyData, "tui.select.down")) {
-			do {
-				this.selectedIndex = this.selectedIndex === this.filteredNodes.length - 1 ? 0 : this.selectedIndex + 1;
-			} while (this.filteredNodes[this.selectedIndex]?.isSessionHeader);
+			this.selectedIndex = this.selectedIndex === this.filteredNodes.length - 1 ? 0 : this.selectedIndex + 1;
 		} else if (kb.matches(keyData, "app.tree.foldOrUp")) {
 			const currentId = this.filteredNodes[this.selectedIndex]?.node.entry.id;
 			if (currentId && this.isFoldable(currentId) && !this.foldedNodes.has(currentId)) {
@@ -1019,7 +934,7 @@ class TreeList implements Component {
 			this.selectedIndex = Math.min(this.filteredNodes.length - 1, this.selectedIndex + this.maxVisibleLines);
 		} else if (kb.matches(keyData, "tui.select.confirm")) {
 			const selected = this.filteredNodes[this.selectedIndex];
-			if (selected && !selected.isSessionHeader && this.onSelect) {
+			if (selected && this.onSelect) {
 				this.onSelect(selected.node.entry.id);
 			}
 		} else if (kb.matches(keyData, "tui.select.cancel")) {
@@ -1243,7 +1158,7 @@ export class TreeSelectorComponent extends Container implements Focusable {
 	}
 
 	constructor(
-		tree: SessionTreeNode[] | MergedTree,
+		tree: SessionTreeNode[],
 		currentLeafId: string | null,
 		terminalHeight: number,
 		onSelect: (entryId: string) => void,
@@ -1278,11 +1193,12 @@ export class TreeSelectorComponent extends Container implements Focusable {
 			keyText("app.tree.filter.all"),
 		].join("/");
 		const cycleKeys = `${keyText("app.tree.filter.cycleForward")}/${keyText("app.tree.filter.cycleBackward")}`;
+		const branchKeys = `${keyText("app.tree.foldOrUp")}/${keyText("app.tree.unfoldOrDown")}`;
 		this.addChild(
 			new TruncatedText(
 				theme.fg(
 					"muted",
-					`  ↑/↓: move. ←/→: page. ^←/^→ or Alt+←/Alt+→: fold/branch. ${keyText("app.tree.editLabel")}: label. ${filterKeys}: filters (${cycleKeys} cycle). ${keyText("app.tree.toggleLabelTimestamp")}: label time`,
+					`  ↑/↓: move. ←/→: page. ${branchKeys}: fold/branch. ${keyText("app.tree.editLabel")}: label. ${filterKeys}: filters (${cycleKeys} cycle). ${keyText("app.tree.toggleLabelTimestamp")}: label time`,
 				),
 				0,
 				0,
@@ -1296,8 +1212,7 @@ export class TreeSelectorComponent extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());
 
-		const hasEntries = Array.isArray(tree) ? tree.length === 0 : tree.entrySessionMap.size === 0;
-		if (hasEntries) {
+		if (tree.length === 0) {
 			setTimeout(() => onCancel(), 100);
 		}
 	}

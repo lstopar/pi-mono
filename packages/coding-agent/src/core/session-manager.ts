@@ -159,27 +159,6 @@ export interface SessionTreeNode {
 	labelTimestamp?: string;
 }
 
-/** Virtual root grouping entries from one session file (for merged tree view). */
-export interface MergedSessionRoot {
-	/** Session file path */
-	sessionFile: string;
-	/** Session display name (from session_info or timestamp fallback) */
-	label: string;
-	/** Timestamp of session creation */
-	created: Date;
-	/** Whether this is the currently active session */
-	isCurrent: boolean;
-	/** Tree roots from this session */
-	tree: SessionTreeNode[];
-}
-
-/** Result of merging trees from multiple session files in the same directory. */
-export interface MergedTree {
-	sessions: MergedSessionRoot[];
-	/** Entry ID → session file path (for lookup on select) */
-	entrySessionMap: Map<string, string>;
-}
-
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;

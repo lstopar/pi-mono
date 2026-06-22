@@ -399,7 +399,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					for (const tool of p.tools) {
 						const t = tool as Record<string, unknown>;
 						const fn = (t.function ?? t) as Record<string, unknown>;
-						lines.push(`- \`${fn.name ?? t.name ?? "unknown"}\``);
+						const name = fn.name ?? t.name ?? "unknown";
+						const description = typeof fn.description === "string" ? fn.description : undefined;
+						const parameters = fn.parameters as Record<string, unknown> | undefined;
+						lines.push(`- \`${name}\`${description ? `: ${description}` : ""}`);
+						if (parameters) {
+							lines.push("");
+							lines.push("```json");
+							lines.push(JSON.stringify(parameters, null, 2));
+							lines.push("```");
+						}
 					}
 					lines.push("");
 				}

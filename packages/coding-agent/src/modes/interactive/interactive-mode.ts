@@ -75,16 +75,7 @@ import { DefaultPackageManager } from "../../core/package-manager.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.js";
 import type { ResourceDiagnostic } from "../../core/resource-loader.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
-import {
-	type LabelEntry,
-	loadEntriesFromFile,
-	type SessionContext,
-	type SessionEntry,
-	type SessionHeader,
-	type SessionInfoEntry,
-	SessionManager,
-	type SessionTreeNode,
-} from "../../core/session-manager.js";
+import { type SessionContext, SessionManager } from "../../core/session-manager.js";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.js";
 import type { SourceInfo } from "../../core/source-info.js";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.js";
@@ -122,7 +113,7 @@ import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
 import { ToolExecutionComponent } from "./components/tool-execution.js";
-import { type MergedSessionRoot, type MergedTree, TreeSelectorComponent } from "./components/tree-selector.js";
+import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import {
@@ -4171,44 +4162,21 @@ export class InteractiveMode {
 	}
 
 	private showTreeSelector(initialSelectedId?: string): void {
-		const merged = buildMergedTree(
-			this.sessionManager.getSessionDir(),
-			this.sessionManager.getSessionFile() ?? undefined,
-		);
+		const tree = this.sessionManager.getTree();
 		const realLeafId = this.sessionManager.getLeafId();
 		const initialFilterMode = this.settingsManager.getTreeFilterMode();
 
-		// Check if there are any entries at all
-		const totalEntries = merged.entrySessionMap.size;
-		if (totalEntries === 0) {
+		if (tree.length === 0) {
 			this.showStatus("No entries in session");
 			return;
 		}
 
 		this.showSelector((done) => {
 			const selector = new TreeSelectorComponent(
-				merged,
+				tree,
 				realLeafId,
 				this.ui.terminal.rows,
 				async (entryId) => {
-					// Check if entry belongs to a different session
-					const targetSessionFile = merged.entrySessionMap.get(entryId);
-					const currentSessionFile = this.sessionManager.getSessionFile();
-					if (targetSessionFile && currentSessionFile && targetSessionFile !== currentSessionFile) {
-						done(); // Close selector
-						try {
-							const result = await this.runtimeHost.switchSession(targetSessionFile);
-							if (!result.cancelled) {
-								this.renderCurrentSessionState();
-								// Re-open tree at the target entry in the new session
-								this.showTreeSelector(entryId);
-							}
-						} catch (error) {
-							this.showError(error instanceof Error ? error.message : String(error));
-						}
-						return;
-					}
-
 					// Selecting the current leaf is a no-op (already there)
 					if (entryId === realLeafId) {
 						done();
@@ -5487,111 +5455,4 @@ export class InteractiveMode {
 			this.isInitialized = false;
 		}
 	}
-}
-
-/**
- * Build a merged tree from all session files in the session directory.
- * Reads every .jsonl file, builds per-session trees, and creates an entry-to-session mapping.
- */
-function buildMergedTree(sessionDir: string, currentSessionFile: string | undefined): MergedTree {
-	if (!fs.existsSync(sessionDir)) {
-		return { sessions: [], entrySessionMap: new Map() };
-	}
-
-	const files = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
-	const sessions: MergedSessionRoot[] = [];
-	const entrySessionMap = new Map<string, string>();
-
-	for (const file of files) {
-		const filePath = path.join(sessionDir, file);
-		const entries = loadEntriesFromFile(filePath);
-		if (entries.length === 0) continue;
-
-		const header = entries.find((e): e is SessionHeader => e.type === "session");
-		if (!header) continue;
-
-		const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");
-		const isCurrent = filePath === currentSessionFile;
-
-		// Build labels map for this session
-		const labelsById = new Map<string, string>();
-		const labelTimestampsById = new Map<string, string>();
-		for (const entry of sessionEntries) {
-			if (entry.type === "label") {
-				const labelEntry = entry as LabelEntry;
-				if (labelEntry.label) {
-					labelsById.set(labelEntry.targetId, labelEntry.label);
-					labelTimestampsById.set(labelEntry.targetId, entry.timestamp);
-				} else {
-					labelsById.delete(labelEntry.targetId);
-					labelTimestampsById.delete(labelEntry.targetId);
-				}
-			}
-		}
-
-		// Build tree from entries
-		const nodeMap = new Map<string, SessionTreeNode>();
-		const roots: SessionTreeNode[] = [];
-
-		for (const entry of sessionEntries) {
-			const label = labelsById.get(entry.id);
-			const labelTimestamp = labelTimestampsById.get(entry.id);
-			nodeMap.set(entry.id, { entry, children: [], label, labelTimestamp });
-		}
-
-		for (const entry of sessionEntries) {
-			const node = nodeMap.get(entry.id)!;
-			if (entry.parentId === null || entry.parentId === entry.id) {
-				roots.push(node);
-			} else {
-				const parent = nodeMap.get(entry.parentId);
-				if (parent) {
-					parent.children.push(node);
-				} else {
-					roots.push(node);
-				}
-			}
-		}
-
-		// Sort children by timestamp (oldest first)
-		const stack: SessionTreeNode[] = [...roots];
-		while (stack.length > 0) {
-			const node = stack.pop()!;
-			node.children.sort((a, b) => new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime());
-			stack.push(...node.children);
-		}
-
-		// Extract session name (latest session_info entry with a name)
-		let sessionLabel: string | undefined;
-		for (let i = sessionEntries.length - 1; i >= 0; i--) {
-			if (sessionEntries[i].type === "session_info") {
-				sessionLabel = (sessionEntries[i] as SessionInfoEntry).name?.trim() || undefined;
-				break;
-			}
-		}
-		if (!sessionLabel) {
-			sessionLabel = new Date(header.timestamp).toLocaleString();
-		}
-
-		// Register entry IDs in the session map
-		for (const entry of sessionEntries) {
-			entrySessionMap.set(entry.id, filePath);
-		}
-
-		sessions.push({
-			sessionFile: filePath,
-			label: sessionLabel,
-			created: new Date(header.timestamp),
-			isCurrent,
-			tree: roots,
-		});
-	}
-
-	// Sort: current session first, then by creation time (newest first)
-	sessions.sort((a, b) => {
-		if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
-		return b.created.getTime() - a.created.getTime();
-	});
-
-	return { sessions, entrySessionMap };
 }
