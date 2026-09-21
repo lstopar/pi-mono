@@ -27,7 +27,9 @@ import type { AssistantMessage } from "../types.ts";
  * - DS4: "Prompt has X tokens, but the configured context size is Y tokens"
  * - Cerebras: "400/413 status code (no body)"
  * - Mistral: "Prompt contains X tokens ... too large for model with Y maximum context length"
- * - z.ai: Does NOT error, accepts overflow silently - handled via usage.input > contextWindow
+ * - z.ai: Does NOT error, accepts overflow silently - handled via usage.input > contextWindow.
+ *   Also: rejects request bodies >1MiB with a misleading HTTP 400 {"code":"1210",
+ *   "message":"Invalid API parameter, please check the documentation."} (gateway size cap, not a real param error).
  * - Xiaomi MiMo: Truncates input to fill contextWindow exactly, then returns finish_reason "length"
  *   with output=0 (no room left to generate). Detected via stopReason "length" + zero output +
  *   input filling the context window.
@@ -54,6 +56,7 @@ const OVERFLOW_PATTERNS = [
 	/too large for model with \d+ maximum context length/i, // Mistral
 	/prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i, // DS4 server
 	/model_context_window_exceeded/i, // z.ai non-standard finish_reason surfaced as error text
+	/Invalid API parameter, please check the documentation/i, // z.ai/glm: HTTP 400 code 1210 on request body >1MiB (gateway size cap, not a real param error)
 	/prompt too long; exceeded (?:max )?context length/i, // Ollama explicit overflow error
 	/range of input length should be/i, // DashScope / Qwen Token Plan
 	/context[_ ]length[_ ]exceeded/i, // Generic fallback

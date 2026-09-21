@@ -344,6 +344,14 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+
+	/**
+	 * Reload extensions, skills, prompts, themes, and context files.
+	 * Emits session_shutdown for the current runtime, reloads resources, then
+	 * re-emits session_start. Treat as terminal for the current handler: this
+	 * context is stale once the promise resolves.
+	 */
+	reload(): Promise<void>;
 }
 
 /**

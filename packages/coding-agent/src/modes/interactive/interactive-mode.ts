@@ -2017,6 +2017,9 @@ export class InteractiveMode {
 				})();
 			},
 			getSystemPrompt: () => this.session.systemPrompt,
+			reload: async () => {
+				await this.handleReloadCommand();
+			},
 		});
 
 		// Set up the extension shortcut handler on the default editor

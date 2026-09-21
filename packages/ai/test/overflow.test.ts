@@ -75,6 +75,16 @@ describe("isContextOverflow", () => {
 		expect(isContextOverflow(commaMessage, 256000)).toBe(true);
 	});
 
+	it("detects ZhipuAI (z.ai) misleading 1210 error on >1MiB request body", () => {
+		// z.ai/glm rejects request bodies >1MiB with HTTP 400 code 1210 "Invalid API parameter"
+		// instead of a proper 413. This is a gateway size cap, not a real parameter error,
+		// so it must trigger auto-compaction.
+		const message = createErrorMessage(
+			'400: {"code":"1210","message":"Invalid API parameter, please check the documentation."}',
+		);
+		expect(isContextOverflow(message, 1000000)).toBe(true);
+	});
+
 	it("does not treat generic non-overflow Ollama errors as overflow", () => {
 		const message = createErrorMessage("500 `model runner crashed unexpectedly`");
 		expect(isContextOverflow(message, 32768)).toBe(false);

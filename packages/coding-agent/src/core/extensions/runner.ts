@@ -747,6 +747,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
 			},
+			reload: () => {
+				runner.assertActive();
+				return runner.reloadHandler();
+			},
 		};
 	}
 

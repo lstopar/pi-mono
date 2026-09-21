@@ -1297,7 +1297,7 @@ Important behavior:
 
 For predictable behavior, treat reload as terminal for that handler (`await ctx.reload(); return;`).
 
-Tools run with `ExtensionContext`, so they cannot call `ctx.reload()` directly. Use a command as the reload entrypoint, then expose a tool that queues that command as a follow-up user message.
+`ctx.reload()` is also available on the event-handler context (`ExtensionContext`), so event handlers and tools can trigger the reload flow directly. The same rules apply: treat it as terminal for the current handler and don't touch the old context afterwards.
 
 Example tool the LLM can call to trigger reload:
 
