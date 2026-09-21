@@ -1196,6 +1196,47 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	// A handler that replaces/reloads the session invalidates the runner
+	// mid-dispatch; later handlers must not run with the stale ctx.
+	describe("stale dispatch", () => {
+		it("stops dispatching to remaining handlers after mid-emit invalidation", async () => {
+			const calls: string[] = [];
+			const runtime = createExtensionRuntime();
+			let runner: ExtensionRunner;
+			const trigger = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("session_start", () => {
+						calls.push("trigger");
+						runner.invalidate();
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const observer = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("session_start", (_event, ctx) => {
+						calls.push("observer");
+						void ctx.sessionManager;
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			runner = new ExtensionRunner([trigger, observer], runtime, tempDir, sessionManager, modelRegistry);
+
+			const errors: unknown[] = [];
+			runner.onError((err) => errors.push(err));
+
+			await runner.emit({ type: "session_start", reason: "startup" });
+
+			expect(calls).toEqual(["trigger"]);
+			expect(errors).toEqual([]);
+		});
+	});
+
 	describe("hasHandlers", () => {
 		it("returns true when handlers exist for event type", async () => {
 			const extCode = `

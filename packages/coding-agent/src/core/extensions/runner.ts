@@ -896,6 +896,13 @@ export class ExtensionRunner {
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
 			for (const handler of handlers) {
+				// A handler may replace or reload the session (ctx.newSession()/fork()/
+				// switchSession()/reload()), which invalidates this runner mid-dispatch.
+				// Remaining handlers would only see a stale ctx, so stop dispatching; the
+				// replacement session re-emits session_start on the fresh runner.
+				if (this.staleMessage) {
+					return result as RunnerEmitResult<TEvent>;
+				}
 				try {
 					const handlerResult = await handler(event, ctx);
 
