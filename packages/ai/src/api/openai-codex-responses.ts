@@ -1,4 +1,3 @@
-import type * as NodeOs from "node:os";
 import type * as NodeZlib from "node:zlib";
 import type {
 	Tool as OpenAITool,
@@ -7,36 +6,21 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
-type ProcessWithOsBuiltinModule = typeof process & {
-	getBuiltinModule?: (id: "node:os") => typeof NodeOs;
-};
-
-function loadNodeOs(): typeof NodeOs | null {
-	if (typeof process === "undefined" || !(process.versions?.node || process.versions?.bun)) {
-		return null;
-	}
-	return (process as ProcessWithOsBuiltinModule).getBuiltinModule?.("node:os") ?? null;
-}
-
-// NEVER convert to top-level runtime imports - breaks browser/Vite builds
-const _os: typeof NodeOs | null = loadNodeOs();
-
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
 	Api,
 	AssistantMessage,
-	Context,
 	Model,
 	ProviderEnv,
 	ProviderHeaders,
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
+	TranscriptContext,
 	Usage,
 } from "../types.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
-import { splitDeferredTools } from "../utils/deferred-tools.ts";
 import {
 	appendAssistantMessageDiagnostic,
 	createAssistantMessageDiagnostic,
@@ -46,6 +30,15 @@ import { formatProviderError, normalizeProviderError } from "../utils/error-body
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
+import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { getSystemMessageText } from "../utils/text.ts";
+import {
+	getDeclaredTools,
+	getInitialSystemMessage,
+	normalizeContext,
+	resolveTranscript,
+	resolveTranscriptTools,
+} from "../utils/transcript.ts";
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
@@ -243,10 +236,11 @@ function compressRequestBodyZstd(bodyJson: string): Uint8Array | null {
 
 export const stream: StreamFunction<"openai-codex-responses", OpenAICodexResponsesOptions> = (
 	model: Model<"openai-codex-responses">,
-	context: Context,
+	context: TranscriptContext,
 	options?: OpenAICodexResponsesOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
+	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	(async () => {
 		const output: AssistantMessage = {
@@ -275,12 +269,12 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 
 			const accountId = extractAccountId(apiKey);
 			const grammarToolInputProperties = createGrammarToolInputProperties(
-				context.tools,
+				getDeclaredTools(normalizedContext.messages),
 				model.compat?.supportsOpenAIGrammarTools ?? false,
 			);
 			const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
 			const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
-			let body = buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties);
+			let body = buildRequestBody(model, normalizedContext, options, codexSessionId, grammarToolInputProperties);
 			const nextBody = await options?.onPayload?.(body, model);
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
@@ -363,7 +357,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							output,
 							createAssistantMessageDiagnostic("provider_transport_failure", error, {
 								configuredTransport: transport,
-								fallbackTransport: websocketStarted ? undefined : "sse",
+								...(websocketStarted ? {} : { fallbackTransport: "sse" }),
 								eventsEmitted: websocketStarted,
 								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
 								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
@@ -505,7 +499,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 
 export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStreamOptions> = (
 	model: Model<"openai-codex-responses">,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
 	const apiKey = options?.apiKey;
@@ -513,7 +507,10 @@ export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStream
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
 
-	const base = buildBaseOptions(model, context, options, apiKey);
+	const base = {
+		...buildBaseOptions(model, context, options, apiKey),
+		toolChoice: options?.toolChoice,
+	} satisfies OpenAICodexResponsesOptions;
 	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
@@ -529,39 +526,35 @@ export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStream
 
 function buildRequestBody(
 	model: Model<"openai-codex-responses">,
-	context: Context,
+	context: TranscriptContext,
 	options: OpenAICodexResponsesOptions | undefined,
 	cacheSessionId: string | undefined,
 	grammarToolInputProperties: ReadonlyMap<string, string> = createGrammarToolInputProperties(
-		context.tools,
+		getDeclaredTools(context.messages),
 		model.compat?.supportsOpenAIGrammarTools ?? false,
 	),
 ): RequestBody {
 	const supportsStrictMode = model.compat?.supportsStrictMode ?? true;
 	const supportsOpenAIGrammarTools = model.compat?.supportsOpenAIGrammarTools ?? false;
-	const deferredToolsMode = model.compat?.supportsAdditionalTools
-		? "additional-tools"
-		: model.compat?.supportsToolSearch
-			? "tool-search"
-			: undefined;
-	const toolPlacement = splitDeferredTools(context, deferredToolsMode !== undefined);
+	const supportsAdditionalTools = model.compat?.supportsAdditionalTools ?? false;
+	const supportsToolSearch = model.compat?.supportsToolSearch ?? false;
+	const transcriptTools = resolveTranscriptTools(context.messages, supportsAdditionalTools || supportsToolSearch);
 	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: false,
 		grammarToolInputProperties,
-		deferredTools: toolPlacement.deferred,
-		deferredToolsMode,
-		toolOptions: {
-			strict: null,
-			supportsStrictMode,
-			supportsOpenAIGrammarTools,
-		},
+		supportsMidConvoSystemMessages: model.compat?.supportsMidConvoSystemMessages ?? false,
+		supportsAdditionalTools,
+		supportsToolSearch,
+		toolOptions: { strict: null, supportsStrictMode, supportsOpenAIGrammarTools },
 	});
 
+	const initialSystemMessage = getInitialSystemMessage(context.messages);
+	const instructions = initialSystemMessage ? getSystemMessageText(initialSystemMessage) : "";
 	const body: RequestBody = {
 		model: model.id,
 		store: false,
 		stream: true,
-		instructions: context.systemPrompt || "You are a helpful assistant.",
+		instructions: instructions || "You are a helpful assistant.",
 		input: messages,
 		text: { verbosity: options?.textVerbosity || "low" },
 		include: ["reasoning.encrypted_content"],
@@ -578,8 +571,8 @@ function buildRequestBody(
 		body.service_tier = options.serviceTier;
 	}
 
-	if (toolPlacement.immediate.length > 0) {
-		body.tools = convertResponsesTools(toolPlacement.immediate, {
+	if (transcriptTools.requestTools.length > 0) {
+		body.tools = convertResponsesTools(transcriptTools.requestTools, {
 			strict: null,
 			supportsStrictMode,
 			supportsOpenAIGrammarTools,
@@ -589,7 +582,9 @@ function buildRequestBody(
 	if (options?.reasoningEffort !== undefined) {
 		const effort =
 			options.reasoningEffort === "none"
-				? (model.thinkingLevelMap?.off ?? "none")
+				? model.thinkingLevelMap?.off === undefined
+					? "none"
+					: model.thinkingLevelMap.off
 				: (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort);
 		if (effort !== null) {
 			body.reasoning = {
@@ -597,6 +592,8 @@ function buildRequestBody(
 				summary: options.reasoningSummary ?? "auto",
 			};
 		}
+	} else if (model.reasoning && model.thinkingLevelMap?.off !== null) {
+		body.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
 	}
 
 	return body;
@@ -793,8 +790,9 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 			if (signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
+			buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+			// Treat EOF as terminating the residual SSE frame.
+			if (done && buffer.trim()) buffer += "\n\n";
 
 			let idx = buffer.indexOf("\n\n");
 			while (idx !== -1) {
@@ -820,6 +818,8 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 				}
 				idx = buffer.indexOf("\n\n");
 			}
+
+			if (done) break;
 		}
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
@@ -1532,10 +1532,15 @@ async function processWebSocketStream(
 		if (options?.signal?.aborted) {
 			keepConnection = false;
 		} else if (useCachedContext && entry && output.responseId) {
-			const responseItems = convertResponsesMessages(model, { messages: [output] }, CODEX_TOOL_CALL_PROVIDERS, {
-				includeSystemPrompt: false,
-				grammarToolInputProperties,
-			}).filter((item) => item.type !== "function_call_output" && item.type !== "custom_tool_call_output");
+			const responseItems = convertResponsesMessages(
+				model,
+				normalizeContext({ messages: [output] }),
+				CODEX_TOOL_CALL_PROVIDERS,
+				{
+					includeSystemPrompt: false,
+					grammarToolInputProperties,
+				},
+			).filter((item) => item.type !== "function_call_output" && item.type !== "custom_tool_call_output");
 			entry.continuation = {
 				lastRequestBody: fullBody,
 				lastResponseId: output.responseId,
@@ -1618,8 +1623,7 @@ function buildBaseCodexHeaders(
 	headers.set("Authorization", `Bearer ${token}`);
 	headers.set("chatgpt-account-id", accountId);
 	headers.set("originator", "pi");
-	const userAgent = _os ? `pi (${_os.platform()} ${_os.release()}; ${_os.arch()})` : "pi (browser)";
-	headers.set("User-Agent", userAgent);
+	headers.set("User-Agent", getPiUserAgent());
 	return headers;
 }
 

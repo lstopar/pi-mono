@@ -5,7 +5,6 @@ import {
 	type AuthContext,
 	type AuthInteraction,
 	type AuthResult,
-	type Context,
 	type Credential,
 	lazyStream,
 	type Model,
@@ -18,6 +17,7 @@ import {
 	type RefreshModelsContext,
 	type SimpleStreamOptions,
 	type StreamOptions,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { getApiProvider } from "@earendil-works/pi-ai/compat";
 import type { ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider } from "./model-config.ts";
@@ -48,7 +48,11 @@ export interface ProviderConfigInput {
 	baseUrl?: string;
 	apiKey?: string;
 	api?: Api;
-	streamSimple?: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
+	streamSimple?: (
+		model: Model<Api>,
+		context: TranscriptContext,
+		options?: SimpleStreamOptions,
+	) => AssistantMessageEventStream;
 	headers?: Record<string, string>;
 	authHeader?: boolean;
 	oauth?: ExtensionOAuthConfig;
@@ -60,7 +64,9 @@ export interface ProviderConfigInput {
 		reasoning: boolean;
 		thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
 		input: ("text" | "image")[];
+		inputLimits?: Model<Api>["inputLimits"];
 		cost: Model<Api>["cost"];
+		promptCache?: Model<Api>["promptCache"];
 		contextWindow: number;
 		maxTokens: number;
 		samplingParams?: Record<string, unknown>;
@@ -100,6 +106,26 @@ function mergeCompat(
 	return merged;
 }
 
+function mergeInputLimits(
+	base: Model<Api>["inputLimits"],
+	override: ModelsJsonModelOverride["inputLimits"],
+): Model<Api>["inputLimits"] {
+	if (!override) return base;
+	return {
+		...base,
+		...override,
+		images: override.images
+			? {
+					...base?.images,
+					...override.images,
+					resize: override.images.resize
+						? { ...base?.images?.resize, ...override.images.resize }
+						: base?.images?.resize,
+				}
+			: base?.images,
+	};
+}
+
 function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride): Model<Api> {
 	return {
 		...model,
@@ -109,6 +135,7 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 			? { ...model.thinkingLevelMap, ...override.thinkingLevelMap }
 			: model.thinkingLevelMap,
 		input: (override.input as ("text" | "image")[] | undefined) ?? model.input,
+		inputLimits: mergeInputLimits(model.inputLimits, override.inputLimits),
 		cost: override.cost
 			? {
 					input: override.cost.input ?? model.cost.input,
@@ -118,6 +145,7 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 					tiers: override.cost.tiers ?? model.cost.tiers,
 				}
 			: model.cost,
+		promptCache: override.promptCache ? { ...model.promptCache, ...override.promptCache } : model.promptCache,
 		contextWindow: override.contextWindow ?? model.contextWindow,
 		maxTokens: override.maxTokens ?? model.maxTokens,
 		samplingParams: override.samplingParams
@@ -156,13 +184,24 @@ function modelFromJson(
 		reasoning: definition.reasoning ?? false,
 		thinkingLevelMap: definition.thinkingLevelMap,
 		input: (definition.input ?? ["text"]) as ("text" | "image")[],
+		inputLimits: definition.inputLimits,
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		promptCache: definition.promptCache,
 		contextWindow: definition.contextWindow ?? 128000,
 		maxTokens: definition.maxTokens ?? 16384,
 		samplingParams: definition.samplingParams,
 		headers: undefined,
 		compat: mergeCompat(providerConfig.compat, definition.compat),
 	};
+}
+
+function findModelDefaults(models: readonly Model<Api>[], modelId: string, api?: Api): Model<Api> | undefined {
+	return (
+		models.find((model) => model.id === modelId) ??
+		(api ? models.find((model) => model.api === api) : undefined) ??
+		models.find((model) => model.api === "openai-completions") ??
+		models[0]
+	);
 }
 
 function applyModelsJson(
@@ -197,7 +236,7 @@ function applyModelsJson(
 	}));
 	for (const definition of config.models ?? []) {
 		const existingIndex = models.findIndex((model) => model.id === definition.id);
-		const defaults = existingIndex >= 0 ? models[existingIndex] : models[0];
+		const defaults = findModelDefaults(models, definition.id, definition.api ?? config.api);
 		const model = modelFromJson(providerId, definition, config, defaults);
 		if (existingIndex >= 0) models[existingIndex] = model;
 		else models.push(model);
@@ -215,7 +254,7 @@ function applyExtension(
 		return config.baseUrl ? models.map((model) => ({ ...model, baseUrl: config.baseUrl! })) : [...models];
 	}
 	return config.models.map((definition) => {
-		const defaults = models.find((model) => model.id === definition.id) ?? models[0];
+		const defaults = findModelDefaults(models, definition.id, definition.api ?? config.api);
 		const api = definition.api ?? config.api ?? defaults?.api;
 		if (!api) {
 			throw new Error(
@@ -453,7 +492,7 @@ export function composeModelProvider(
 	const supportsBaseApi = (model: Model<Api>) => base?.getModels().some((entry) => entry.api === model.api) ?? false;
 	const streamWith = (
 		model: Model<Api>,
-		context: Context,
+		context: TranscriptContext,
 		options: StreamOptions | undefined,
 		simple: boolean,
 	): AssistantMessageEventStream =>

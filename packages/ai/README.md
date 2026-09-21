@@ -26,6 +26,7 @@ Unified LLM API with provider collections, automatic auth resolution, token and 
   - [Streaming Tool Calls with Partial JSON](#streaming-tool-calls-with-partial-json)
   - [Validating Tool Arguments](#validating-tool-arguments)
   - [Complete Event Reference](#complete-event-reference)
+  - [Compact Assistant Message Frames](#compact-assistant-message-frames)
 - [Image Input](#image-input)
 - [Image Generation](#image-generation)
 - [Thinking/Reasoning](#thinkingreasoning)
@@ -43,6 +44,7 @@ Unified LLM API with provider collections, automatic auth resolution, token and 
   - [OpenAI Compatibility Settings](#openai-compatibility-settings)
 - [Faux Provider for Tests](#faux-provider-for-tests)
 - [Cross-Provider Handoffs](#cross-provider-handoffs)
+- [System Messages](#system-messages)
 - [Context Serialization](#context-serialization)
 - [Browser Usage](#browser-usage)
 - [Bundling and Tree Shaking](#bundling-and-tree-shaking)
@@ -60,6 +62,7 @@ Unified LLM API with provider collections, automatic auth resolution, token and 
 - **Ant Ling**
 - **Azure OpenAI (Responses)**
 - **OpenAI Codex** (ChatGPT Plus/Pro subscription, requires OAuth, see below)
+- **Radius** (API key or OAuth, with a dynamically refreshed gateway catalog)
 - **DeepSeek**
 - **NVIDIA NIM**
 - **Anthropic**
@@ -85,6 +88,7 @@ Unified LLM API with provider collections, automatic auth resolution, token and 
 - **OpenCode Go**
 - **Fireworks** (uses OpenAI- and Anthropic-compatible APIs)
 - **Kimi For Coding** (Moonshot AI subscription endpoint, uses Anthropic-compatible API)
+- **Meta** (Model API, uses OpenAI Responses-compatible API)
 - **Qwen Token Plan** (separate Individual and existing catalogs, with a separate China provider)
 - **Xiaomi MiMo** (defaults to API billing endpoint, with separate Token Plan providers for `cn`/`ams`/`sgp` regions)
 - **Any OpenAI-compatible API**: Ollama, vLLM, LM Studio, etc.
@@ -304,6 +308,7 @@ For tooling that wants the generated built-in catalog with full literal typing (
 import { getBuiltinModel, getBuiltinModels, getBuiltinProviders } from '@earendil-works/pi-ai/providers/all';
 
 const model = getBuiltinModel('openai', 'gpt-4o-mini'); // typed Model<'openai-responses'>
+const radius = getBuiltinModel('radius', 'balanced');     // typed Model<'pi-messages'>
 const providers = getBuiltinProviders();
 const anthropic = getBuiltinModels('anthropic');
 ```
@@ -319,7 +324,7 @@ await models.refresh();                            // refresh all providers conc
 const fresh = models.getModel('llamacpp', 'qwen3-30b');
 ```
 
-Static built-in providers are no-ops for `refresh()`. See [createProvider()](#createprovider) for building a dynamic provider.
+Static built-in providers are no-ops for `refresh()`. Radius is both static and dynamic: it ships the public `radius.pi.dev` catalog for synchronous API lookup, then overlays cached and freshly fetched `/v1/config` models when refreshed with configured auth. See [createProvider()](#createprovider) for building a dynamic provider.
 
 ## Auth
 
@@ -416,6 +421,7 @@ Built-in providers resolve these env vars (Node.js; in browsers pass `apiKey` ex
 | Ant Ling | `ANT_LING_API_KEY` |
 | Azure OpenAI | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_BASE_URL` (e.g. `https://{resource}.ai.azure.com`) or `AZURE_OPENAI_RESOURCE_NAME`. Supports `*.openai.azure.com`, `*.cognitiveservices.azure.com` and `*.ai.azure.com`; root endpoints auto-normalize to `/openai/v1`. Optional: `AZURE_OPENAI_API_VERSION` (default `v1`), `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`. |
 | Anthropic | `ANTHROPIC_API_KEY` or `ANTHROPIC_OAUTH_TOKEN` |
+| Radius | `RADIUS_API_KEY` |
 | DeepSeek | `DEEPSEEK_API_KEY` |
 | NVIDIA NIM | `NVIDIA_API_KEY` |
 | Google | `GEMINI_API_KEY` |
@@ -439,6 +445,7 @@ Built-in providers resolve these env vars (Node.js; in browsers pass `apiKey` ex
 | Hugging Face | `HF_TOKEN` |
 | OpenCode Zen / OpenCode Go | `OPENCODE_API_KEY` |
 | Kimi For Coding | `KIMI_API_KEY` |
+| Meta | `META_API_KEY` |
 | Qwen Token Plan (existing catalog) | `QWEN_TOKEN_PLAN_API_KEY` |
 | Qwen Token Plan (Individual) | `QWEN_TOKEN_PLAN_API_KEY` |
 | Qwen Token Plan (China) | `QWEN_TOKEN_PLAN_CN_API_KEY` |
@@ -651,6 +658,10 @@ for await (const event of s) {
 
 ### Complete Event Reference
 
+Successful generation follows `start → updates* → done`. A failure after generation starts follows `start → updates* → error`. Request setup may fail before generation starts, in which case the stream contains only `error`; `done` and update events are invalid before `start`. Direct API `streamSimple()` calls throw synchronously when request auth is missing.
+
+Every non-terminal event's `partial` is the shared live response-so-far helper. It is intentionally not an event-time snapshot: providers may mutate the same message and content blocks as generation advances, including while older events wait in the stream queue. Inspect it when handling an event instead of retaining it as historical state. Text and ordinary thinking blocks are empty when their `*_start` event is emitted and grow only through matching `*_delta` events until the authoritative `*_end`; redacted thinking may be complete at start and emit no deltas. Tool-call arguments at `toolcall_start` are provider-specific; `toolcall_delta` carries subsequent JSON updates.
+
 All streaming events emitted during assistant message generation:
 
 | Event Type | Description | Key Properties |
@@ -664,11 +675,39 @@ All streaming events emitted during assistant message generation:
 | `thinking_end` | Thinking block complete | `content`: Full thinking, `contentIndex`: Position |
 | `toolcall_start` | Tool call begins | `contentIndex`: Position in content array |
 | `toolcall_delta` | Tool arguments streaming | `delta`: JSON chunk, `partial.content[contentIndex].arguments`: Partial parsed args |
-| `toolcall_end` | Tool call complete | `toolCall`: Complete validated tool call with `id`, `name`, `arguments` |
+| `toolcall_end` | Tool call complete | `toolCall`: Complete, but not schema-validated, tool call with `id`, `name`, `arguments` |
 | `done` | Stream complete | `reason`: Stop reason ("stop", "length", "toolUse"), `message`: Final assistant message |
 | `error` | Error occurred | `reason`: Error type ("error" or "aborted"), `error`: AssistantMessage with partial content |
 
 Streaming events for different content blocks are not guaranteed to be contiguous. Providers may emit deltas for text, thinking, and tool calls in the same upstream chunk, and pi may surface corresponding events interleaved, for example `text_start`, `text_delta`, `toolcall_start`, `text_delta`, `toolcall_delta`. Consumers must use `contentIndex` to associate each delta/end event with its block and must not assume that a block's `*_start`/`*_delta`/`*_end` sequence is uninterrupted by events for other blocks.
+
+### Compact Assistant Message Frames
+
+`AssistantMessageFrameEncoder` converts one stream into compact, persistable `AssistantMessageFrame` values. Create one encoder per stream and feed it every event in order. The encoder understands that `partial` is live: a block-start event consumed after the provider has already queued later deltas snapshots the current block once, and covered queued text/thinking deltas produce no duplicate frame. It retains only per-open-block counters plus, temporarily, the raw prefix needed to synchronize an already-advanced tool call. It never clones the growing full partial per token.
+
+The start frame contains message metadata with empty content. Text and thinking frames store each generated character at most once before the authoritative end frame. Tool calls that were already advanced when their start event was consumed use one compact JSON checkpoint before ordinary deltas resume. Terminal `done` and `error` events produce no frame because final message settlement is separate. A pre-generation `error` therefore produces no frames.
+
+`reduceAssistantMessageFrames()` is the canonical pure reducer. It reconstructs text, thinking, and tool-call arguments, including interleaved blocks identified by `contentIndex`, and rejects malformed sequences. It performs a single pass over the iterable and returns `undefined` when there is no start frame. End frames replace blocks with the provider's authoritative completed content and metadata. The reducer does not validate tool arguments against a TypeBox schema; call `validateToolCall` before execution.
+
+```typescript
+import {
+  AssistantMessageFrameEncoder,
+  reduceAssistantMessageFrames,
+  type AssistantMessageFrame,
+} from '@earendil-works/pi-ai';
+
+const encoder = new AssistantMessageFrameEncoder();
+const frames: AssistantMessageFrame[] = [];
+for await (const event of s) {
+  const frame = encoder.encode(event);
+  if (frame) frames.push(frame);
+}
+
+const reconstructedPartial = reduceAssistantMessageFrames(frames);
+const finalMessage = await s.result(); // Persist terminal settlement separately.
+```
+
+An encoder rejects duplicate starts, updates before start, `done` before start, events after a terminal event, duplicate block starts, and block-kind mismatches. An `error` before start is valid and returns no frame.
 
 ## Image Input
 
@@ -794,7 +833,7 @@ Many models support thinking/reasoning capabilities where they can show their in
 const model = models.getModel('anthropic', 'claude-sonnet-4-5')!;
 // or models.getModel('openai', 'gpt-5-mini');
 // or models.getModel('google', 'gemini-2.5-flash');
-// or models.getModel('xai', 'grok-4.5');
+// or models.getModel('xai', 'grok-4.6');
 
 // Check if model supports reasoning
 if (model.reasoning) {
@@ -894,7 +933,7 @@ Every `AssistantMessage` includes a `stopReason` field that indicates how the ge
 
 ## Error Handling
 
-Request failures never throw out of the stream functions: when a request ends with an error (including aborts and tool call validation errors), the streaming API emits an error event and the final message carries the details:
+Request failures after a stream is returned never throw: when a request ends with an error (including aborts and tool call validation errors), the streaming API emits an error event and the final message carries the details. Setup failures may emit `error` without `start`; failures after generation begins emit `start`, any observed updates, then `error`. Direct API `streamSimple()` calls throw synchronously when request auth is missing:
 
 ```typescript
 // In streaming
@@ -916,7 +955,7 @@ if (message.stopReason === 'error' || message.stopReason === 'aborted') {
 }
 ```
 
-Auth failures (no key configured, OAuth refresh failed, unknown provider) surface the same way: as a stream error with `stopReason: "error"`.
+When using a provider collection, auth failures (OAuth refresh failed, unknown provider) surface as a stream error with `stopReason: "error"`. Direct API `streamSimple()` calls instead throw synchronously when their required auth is absent.
 
 ### Aborting Requests
 
@@ -1135,12 +1174,13 @@ const ollamaReasoningModel: Model<'openai-completions'> = {
 
 ### Calling API Implementations Directly
 
-The API implementations are importable on their own. Each module exports exactly `stream` and `streamSimple` with that API's full option typing. Direct calls bypass provider auth — pass `apiKey` explicitly:
+The API implementations are importable on their own. Each module exports exactly `stream` and `streamSimple` with that API's full option typing. Direct calls bypass provider auth and context normalization — pass `apiKey` explicitly and wrap the context in `normalizeContext()`:
 
 ```typescript
+import { normalizeContext } from '@earendil-works/pi-ai';
 import { stream } from '@earendil-works/pi-ai/api/anthropic-messages';
 
-const s = stream(claudeModel, context, {
+const s = stream(claudeModel, normalizeContext(context), {
   apiKey: process.env.ANTHROPIC_API_KEY,
   thinkingEnabled: true,
   thinkingBudgetTokens: 2048,
@@ -1173,9 +1213,11 @@ interface OpenAICompletionsCompat {
   supportsDeveloperRole?: boolean;   // Whether provider supports `developer` role vs `system` (default: true)
   supportsReasoningEffort?: boolean; // Whether provider supports `reasoning_effort` (default: true)
   supportsUsageInStreaming?: boolean; // Whether provider supports `stream_options: { include_usage: true }` (default: true)
-  supportsStrictMode?: boolean;      // Whether provider supports `strict` in tool definitions (default: true)
+  supportsStrictMode?: boolean;      // Whether provider supports `strict` in tool definitions (default: false; enabled in metadata for capable built-in models)
   supportsOpenAIGrammarTools?: boolean; // Whether to emit OpenAI custom Lark/regex grammar tools; false falls back to normal function tools (default: false; the generated catalog enables it for capable models)
-  sendSessionAffinityHeaders?: boolean; // Send session-affinity data from `sessionId` (default: false)
+  supportsMidConvoSystemMessages?: boolean; // Whether the model accepts system messages after the conversation started; false folds them into the leading prompt (default: false; the generated catalog enables it for verified models)
+  supportsMidConvoToolAdditions?: boolean; // Whether system messages can add tools mid-conversation via Kimi-style `tools` system messages; requires supportsMidConvoSystemMessages (default: false)
+  sendSessionAffinityHeaders?: boolean; // Send session-affinity data from `sessionId` (default: true for OpenRouter, false otherwise)
   sessionAffinityFormat?: 'openai' | 'openai-nosession' | 'openrouter'; // Format for session affinity: 'openai' uses `prompt_cache_key`, `session_id`, `x-client-request-id`, and `x-session-affinity`; 'openai-nosession' uses `prompt_cache_key`, `x-client-request-id`, and `x-session-affinity`; 'openrouter' uses `x-session-id` (default: auto-detected)
   maxTokensField?: 'max_completion_tokens' | 'max_tokens';  // Which field name to use (default: max_completion_tokens)
   requiresToolResultName?: boolean;  // Whether tool results require the `name` field (default: false)
@@ -1183,8 +1225,10 @@ interface OpenAICompletionsCompat {
   requiresThinkingAsText?: boolean;  // Whether thinking blocks must be converted to text (default: false)
   requiresReasoningContentOnAssistantMessages?: boolean; // Whether all replayed assistant messages must include empty reasoning_content when reasoning is enabled (default: auto-detected for DeepSeek)
   thinkingFormat?: 'openai' | 'openrouter' | 'deepseek' | 'together' | 'baseten' | 'zai' | 'qwen' | 'chat-template' | 'qwen-chat-template' | 'string-thinking' | 'ant-ling'; // Format for reasoning param: 'openai' uses reasoning_effort, 'openrouter' uses reasoning: { effort }, 'deepseek' uses thinking: { type } plus reasoning_effort when supported, 'together' uses reasoning: { enabled } plus reasoning_effort when supported, 'baseten' uses configurable chat_template_args plus reasoning_effort when supported, 'zai' uses thinking: { type }, 'qwen' uses enable_thinking, 'chat-template' uses configurable chat_template_kwargs, 'qwen-chat-template' uses chat_template_kwargs.enable_thinking and preserve_thinking, 'string-thinking' uses top-level thinking, 'ant-ling' uses reasoning: { effort } only for mapped efforts (default: openai)
-  chatTemplateKwargs?: Record<string, string | number | boolean | null | { '$var': 'thinking.enabled' | 'thinking.effort'; omitWhenOff?: boolean }>; // chat_template_kwargs values; use $var for pi-controlled thinking values
-  chatTemplateArgs?: Record<string, string | number | boolean | null | { '$var': 'thinking.enabled' | 'thinking.effort'; omitWhenOff?: boolean }>; // chat_template_args values for thinkingFormat: 'baseten'; use $var for pi-controlled thinking values
+  chatTemplateKwargs?: Record<string, string | number | boolean | null | { '$var': 'thinking.enabled' | 'thinking.effort' | 'thinking.budget'; omitWhenOff?: boolean }>; // chat_template_kwargs values; use $var for pi-controlled thinking values
+  chatTemplateArgs?: Record<string, string | number | boolean | null | { '$var': 'thinking.enabled' | 'thinking.effort' | 'thinking.budget'; omitWhenOff?: boolean }>; // chat_template_args values for thinkingFormat: 'baseten'; use $var for pi-controlled thinking values
+  thinkingTokenBudgetField?: 'thinking_token_budget' | 'thinking_budget' | 'thinking_budget_tokens'; // Top-level field that caps reasoning tokens from thinkingBudgets (vLLM / Qwen / llama.cpp). Off by default.
+  supportsThinkingTokenBudget?: boolean; // Alias for thinkingTokenBudgetField: 'thinking_token_budget' (vLLM). Prefer thinkingTokenBudgetField. Default: false.
   cacheControlFormat?: 'anthropic';  // Anthropic-style cache_control on system prompt, last tool, and last user/assistant text content
   openRouterRouting?: OpenRouterRouting; // OpenRouter routing preferences (default: {})
   vercelGatewayRouting?: VercelGatewayRouting; // Vercel AI Gateway routing preferences (default: {})
@@ -1198,6 +1242,8 @@ interface OpenAIResponsesCompat {
   supportsOpenAIGrammarTools?: boolean; // Whether to emit OpenAI custom Lark/regex grammar tools; false falls back to normal function tools (default: false; the generated catalog enables it for capable models)
 }
 ```
+
+OpenRouter requests send `x-session-id` from `sessionId` when prompt caching is enabled. Chat Completions and Anthropic Messages both auto-detect OpenRouter endpoints unless `sendSessionAffinityHeaders` is explicitly false. On Anthropic-compatible models, `sessionAffinityFormat: "openrouter"` selects `x-session-id`; when unset, the existing `x-session-affinity` format is used. Explicit request headers take precedence over generated headers.
 
 If `compat` is not set, the library falls back to URL-based detection. If `compat` is partially set, unspecified fields use the detected defaults. This is useful for:
 
@@ -1333,6 +1379,39 @@ const geminiResponse = await models.complete(gemini, context);
 ```
 
 All providers can handle messages from other providers — text, tool calls and results (including images), thinking blocks (transformed to tagged text), and aborted messages with partial content. This enables flexible workflows: start with a fast model, switch to a more capable one for complex reasoning, or maintain continuity across provider outages.
+
+## System Messages
+
+`Context.systemPrompt` and `Context.tools` are shorthand for a leading system message. The public entry points (`Models.stream()`, `streamSimple()`, `complete()`, `completeSimple()`) accept a `Context` and call `normalizeContext()` once; everything below them, including `Provider.stream()`, `ProviderStreams`, and the API implementation modules, receives the resulting `TranscriptContext`, which only has `messages`. The transcript can also carry system messages later in the conversation to change the prompt or the tool set without rewriting the history:
+
+```typescript
+interface SystemMessage {
+  role: "system";
+  content: string | TextContent[];             // leading: base prompt; later: added instructions
+  sections?: Record<string, string | null>;    // named prompt sections; later messages patch by name, null removes
+  toolsAdded?: Tool[];                         // tools that become available here
+  toolsRemoved?: ToolReference[];              // tools that stop being available here
+  timestamp: number;
+}
+```
+
+Sections are opaque text rendered verbatim after `content`, joined by blank lines. Keep each one self-delimiting (a tag, a heading) so the model can relate an update to the original. Replaying every system message in order yields the current prompt and tools; the replay helpers take the message list:
+
+```typescript
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
+
+const messages: Message[] = [
+  { role: "system", content: "You are helpful.", sections: { rules: "<rules>Be brief.</rules>" }, toolsAdded: [readTool], timestamp: 1 },
+  { role: "user", content: "hi", timestamp: 2 },
+  { role: "system", content: "", sections: { rules: "<rules>Be thorough.</rules>" }, toolsRemoved: [{ name: "read" }], timestamp: 3 },
+];
+getCurrentSystemPrompt(messages); // "You are helpful.\n\n<rules>Be thorough.</rules>"
+getCurrentTools(messages);        // []
+```
+
+A custom `Provider` or `ProviderStreams` implementation reads the prompt and tools the same way from `context.messages`; `context.systemPrompt` and `context.tools` do not exist at that layer.
+
+Models that accept system messages mid-conversation (`supportsMidConvoSystemMessages` in the model's compat settings, set by the generated catalog for verified models) receive each later system message in place, so the cached prefix stays intact; section changes are framed by name for the model. Every other model receives `collapseSystemMessages(transcript)`: the replayed prompt and current tools as the leading system message, with later system messages dropped. Anthropic models that also set `supportsMidConvoToolChanges` send tool changes as native `tool_addition`/`tool_removal` blocks: the initial tools stay active at the top level, every later declaration is sent with `defer_loading` (plus a stable deferred placeholder from the first request, which keeps Anthropic's deferred-tool scaffolding in the cached prefix), and removed tools stay declared, so tool changes do not invalidate the prompt cache. That needs at least one initial tool and no same-name redefinition; otherwise the current tool list is sent at the top level with the system text only. OpenAI Responses models with `supportsAdditionalTools` or `supportsToolSearch` anchor additive tool changes at their message; everything else sends the current tool list at the top level.
 
 ## Context Serialization
 
@@ -1554,7 +1633,7 @@ Built-in login and refresh flows are private provider implementations. Use provi
 
 Provider notes:
 
-**OpenAI Codex**: Requires a ChatGPT Plus or Pro subscription. Provides access to GPT-5.x Codex models with extended context windows and reasoning capabilities. The library automatically handles session-based prompt caching when `sessionId` is provided in stream options unless `cacheRetention` is `"none"`. You can set `transport` in stream options to `"sse"`, `"websocket"`, or `"auto"` for Codex Responses transport selection. When using WebSocket with a `sessionId` and cache retention enabled, connections are reused per session and expire after 5 minutes of inactivity.
+**OpenAI Codex**: Requires a ChatGPT Plus or Pro subscription. Provides access to GPT-5.x Codex models with extended context windows and reasoning capabilities. The library automatically handles session-based prompt caching when `sessionId` is provided in stream options unless `cacheRetention` is `"none"`. You can set `transport` in stream options to `"sse"`, `"websocket"`, or `"auto"` for Codex Responses transport selection. When using WebSocket with a `sessionId` and cache retention enabled, connections are reused per session and expire after 5 minutes of inactivity. Call `cleanupSessionResources(sessionId)` when finished so the pooled connection does not keep the process alive.
 
 **Azure OpenAI (Responses)**: Uses the Responses API only. Set `AZURE_OPENAI_API_KEY` and either `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`. `AZURE_OPENAI_BASE_URL` supports both `https://<resource>.openai.azure.com` and `https://<resource>.cognitiveservices.azure.com`; root endpoints are normalized to `.../openai/v1` automatically. Use `AZURE_OPENAI_API_VERSION` (defaults to `v1`) to override the API version if needed. Deployment names are treated as model IDs by default, override with `azureDeploymentName` or `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` using comma-separated `model-id=deployment` pairs (for example `gpt-4o-mini=my-deployment,gpt-4o=prod`). Legacy deployment-based URLs are intentionally unsupported.
 
@@ -1601,7 +1680,7 @@ Adding a new LLM provider requires changes across multiple files. The layered la
 Create a new API implementation file (for example `bedrock-converse-stream.ts`) that exports exactly `stream` and `streamSimple`, plus:
 
 - An options interface extending `StreamOptions` (for example `BedrockOptions`)
-- Message conversion functions to transform `Context` to provider format
+- Message conversion functions to transform the `TranscriptContext` messages to provider format; read the prompt and tools from the transcript with `getInitialSystemMessage()`, `getCurrentTools()`, and `resolveTranscript()`
 - Tool conversion if the provider supports tools
 - Response parsing to emit standardized events (`text`, `tool_call`, `thinking`, `usage`, `stop`)
 

@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { convertMessages } from "../src/api/openai-completions.ts";
-import { getModel, stream, streamSimple } from "../src/compat.ts";
+import { getModel, normalizeContext, stream, streamSimple } from "../src/compat.ts";
 import type { AssistantMessage, Model, SimpleStreamOptions, Tool, ToolResultMessage } from "../src/types.ts";
 
 const mockState = vi.hoisted(() => ({
@@ -150,6 +150,30 @@ describe("openai-completions tool_choice", () => {
 		expect(params.tools?.length ?? 0).toBeGreaterThan(0);
 	});
 
+	it("includes toolChoice when no tools are provided", async () => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = { ...baseModel, api: "openai-completions" } as const;
+		let payload: unknown;
+
+		await streamSimple(
+			model,
+			{
+				messages: [{ role: "user", content: "Summarize the conversation", timestamp: Date.now() }],
+			},
+			{
+				apiKey: "test",
+				toolChoice: "none",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		const params = (payload ?? mockState.lastParams) as { tool_choice?: string; tools?: unknown[] };
+		expect(params.tool_choice).toBe("none");
+		expect(params).not.toHaveProperty("tools");
+	});
+
 	it("omits strict when compat disables strict mode", async () => {
 		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
 		const model = {
@@ -193,6 +217,82 @@ describe("openai-completions tool_choice", () => {
 		expect(tool).toBeTruthy();
 		expect(tool?.strict).toBeUndefined();
 		expect("strict" in (tool ?? {})).toBe(false);
+	});
+
+	it("defaults unknown OpenAI-compatible endpoints to non-strict tools", async () => {
+		// Regression test for #9816.
+		const model = {
+			...localOpenAICompletionsModel,
+			id: "local-model",
+			name: "Local Model",
+		} satisfies Model<"openai-completions">;
+		const tool: Tool = {
+			name: "ping",
+			description: "Ping tool",
+			parameters: Type.Object({
+				required: Type.String(),
+				optional: Type.Optional(Type.String()),
+			}),
+			constrainedSampling: { type: "json_schema", strict: "prefer" },
+		};
+		let payload: unknown;
+
+		await streamSimple(
+			model,
+			{
+				messages: [{ role: "user", content: "Call ping", timestamp: Date.now() }],
+				tools: [tool],
+			},
+			{
+				apiKey: "test",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		const params = (payload ?? mockState.lastParams) as {
+			tools?: Array<{ function?: { strict?: boolean; parameters?: { required?: string[] } } }>;
+		};
+		const functionTool = params.tools?.[0]?.function;
+		expect(functionTool).not.toHaveProperty("strict");
+		expect(functionTool?.parameters?.required).toEqual(["required"]);
+	});
+
+	it("preserves strict tools for capable built-in Chat Completions models", async () => {
+		const model = getModel("groq", "openai/gpt-oss-20b")!;
+		expect(model.compat?.supportsStrictMode).toBe(true);
+		const tool: Tool = {
+			name: "ping",
+			description: "Ping tool",
+			parameters: Type.Object({
+				required: Type.String(),
+				optional: Type.Optional(Type.String()),
+			}),
+			constrainedSampling: { type: "json_schema", strict: "prefer" },
+		};
+		let payload: unknown;
+
+		await streamSimple(
+			model,
+			{
+				messages: [{ role: "user", content: "Call ping", timestamp: Date.now() }],
+				tools: [tool],
+			},
+			{
+				apiKey: "test",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		const params = (payload ?? mockState.lastParams) as {
+			tools?: Array<{ function?: { strict?: boolean; parameters?: { required?: string[] } } }>;
+		};
+		const functionTool = params.tools?.[0]?.function;
+		expect(functionTool?.strict).toBe(true);
+		expect(functionTool?.parameters?.required).toEqual(["required", "optional"]);
 	});
 
 	it("maps Groq Qwen reasoning levels to default reasoning_effort", async () => {
@@ -295,15 +395,31 @@ describe("openai-completions tool_choice", () => {
 		expect(getModel("zai", "glm-5.2")?.compat?.zaiToolStream).toBe(true);
 	});
 
-	it("stores z.ai GLM-5.2 effort metadata", () => {
-		for (const provider of ["zai", "zai-coding-cn"] as const) {
-			const model = getModel(provider, "glm-5.2")!;
+	it("stores z.ai effort metadata", () => {
+		for (const modelId of ["glm-5.2", "glm-5.2-highspeed"] as const) {
+			const model = getModel("zai", modelId)!;
 			expect(model.compat?.supportsReasoningEffort).toBe(true);
 			expect(model.thinkingLevelMap).toEqual({
+				off: "none",
 				minimal: null,
-				low: "high",
-				medium: "high",
+				low: null,
+				medium: null,
 				high: "high",
+				xhigh: null,
+				max: "max",
+			});
+		}
+
+		for (const provider of ["zai", "zai-coding-cn"] as const) {
+			const glm53 = getModel(provider, "glm-5.3")!;
+			expect(glm53.compat?.supportsReasoningEffort).toBe(true);
+			expect(glm53.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: null,
+				high: "high",
+				xhigh: null,
 				max: "max",
 			});
 		}
@@ -1056,10 +1172,10 @@ describe("openai-completions tool_choice", () => {
 		expect(params.messages?.[0]?.role).toBe("system");
 	});
 
-	it("keeps developer messages for OpenAI and Anthropic OpenRouter reasoning model instructions", async () => {
+	it("keeps developer messages for OpenAI and Anthropic OpenRouter batch instructions", async () => {
 		for (const model of [
 			getModel("openrouter", "openai/gpt-5.2-codex"),
-			getModel("openrouter", "anthropic/claude-sonnet-4.5"),
+			getModel("openrouter", "anthropic/claude-fable-5.1:batch"),
 		]) {
 			expect(model).toBeDefined();
 			let payload: unknown;
@@ -1255,7 +1371,7 @@ describe("openai-completions tool_choice", () => {
 		const model = { ...baseModel, api: "openai-completions" } as Model<"openai-completions">;
 		const messages = convertMessages(
 			model,
-			{
+			normalizeContext({
 				messages: [
 					{
 						role: "assistant",
@@ -1278,7 +1394,7 @@ describe("openai-completions tool_choice", () => {
 						timestamp: Date.now(),
 					},
 				],
-			},
+			}),
 			{
 				...model.compat,
 				supportsStore: false,
@@ -1437,11 +1553,14 @@ describe("openai-completions tool_choice", () => {
 			provider: "custom-deepseek",
 			baseUrl: "https://api.deepseek.com",
 		} satisfies Model<"openai-completions">;
-		const nativeModels = [
-			getModel("deepseek", "deepseek-v4-flash")!,
-			getModel("deepseek", "deepseek-v4-pro")!,
-		] as const;
-		const cases = [...nativeModels, customModel] as const;
+		const customUppercaseModel = {
+			...customModel,
+			id: "custom-uppercase-deepseek-model",
+			name: "Custom Uppercase DeepSeek Model",
+			baseUrl: "https://API.DeepSeek.COM",
+		} satisfies Model<"openai-completions">;
+		const nativeModels = [getModel("deepseek", "deepseek-flash")!, getModel("deepseek", "deepseek-v4-pro")!] as const;
+		const cases = [...nativeModels, customModel, customUppercaseModel] as const;
 
 		for (const model of nativeModels) {
 			expect(model.compat?.maxTokensField).toBe("max_tokens");
@@ -1756,7 +1875,7 @@ describe("openai-completions tool_choice", () => {
 			thinkingFormat: "ant-ling",
 			supportsLongCacheRetention: false,
 		});
-		expect(model.compat?.supportsStrictMode).toBeUndefined();
+		expect(model.compat?.supportsStrictMode).toBe(true);
 		expect(model.compat?.requiresReasoningContentOnAssistantMessages).toBeUndefined();
 
 		await streamSimple(

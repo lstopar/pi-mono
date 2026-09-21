@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 import { describe, expect, it } from "vitest";
-import type { Tool, ToolCall } from "../src/types.ts";
+import type { JsonValue, Tool, ToolCall } from "../src/types.ts";
 import { validateToolArguments } from "../src/utils/validation.ts";
 
 function createToolCallWithPlainSchema(
@@ -27,7 +27,7 @@ function createToolCallWithPlainSchema(
 		type: "toolCall",
 		id: "tool-1",
 		name: "echo",
-		arguments: { value },
+		arguments: { value: value as JsonValue },
 	};
 
 	return { tool, toolCall };
@@ -96,6 +96,51 @@ describe("validateToolArguments", () => {
 			const { tool, toolCall } = createToolCallWithPlainSchema(testCase.schema, testCase.input);
 			expect(validateToolArguments(tool, toolCall)).toEqual({ value: testCase.expected });
 		}
+	});
+
+	it("treats null as omission for optional non-nullable properties", () => {
+		const tool: Tool = {
+			name: "echo",
+			description: "Echo tool",
+			parameters: Type.Object({
+				path: Type.String(),
+				offset: Type.Optional(Type.Number()),
+				nullable: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+				metadata: Type.Object({ enabled: Type.Optional(Type.Boolean()) }),
+			}),
+		};
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "tool-1",
+			name: "echo",
+			arguments: { path: "file.txt", offset: null, nullable: null, metadata: { enabled: null } },
+		};
+
+		expect(validateToolArguments(tool, toolCall)).toEqual({
+			path: "file.txt",
+			nullable: null,
+			metadata: {},
+		});
+	});
+
+	it("preserves optional nulls whose referenced schema is nullable", () => {
+		const tool: Tool = {
+			name: "echo",
+			description: "Echo tool",
+			parameters: {
+				type: "object",
+				properties: { value: { $ref: "#/$defs/value" } },
+				$defs: { value: { anyOf: [{ type: "number" }, { type: "null" }] } },
+			} as Tool["parameters"],
+		};
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "tool-1",
+			name: "echo",
+			arguments: { value: null },
+		};
+
+		expect(validateToolArguments(tool, toolCall)).toEqual({ value: null });
 	});
 
 	it("preserves a value that already matches a nullable union arm", () => {
