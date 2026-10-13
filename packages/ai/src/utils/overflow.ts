@@ -27,8 +27,8 @@ import type { AssistantMessage } from "../types.ts";
  * - DS4: "Prompt has X tokens, but the configured context size is Y tokens"
  * - Cerebras: "400/413 status code (no body)"
  * - Mistral: "Prompt contains X tokens ... too large for model with Y maximum context length"
- * - z.ai: `{"code":"1261","message":"Prompt too long"}`, or accepts overflow silently - handled
- *   via usage.input > contextWindow. Also: rejects request bodies >1MiB with a misleading HTTP 400
+ * - z.ai: `{"code":"1261","message":"Prompt too long"}`, `{"code":"1261","message":"Prompt exceeds max length"}` (CN endpoint), or silent overflow via usage.input > contextWindow.
+ *   Also: rejects request bodies >1MiB with a misleading HTTP 400
  *   {"code":"1210","message":"Invalid API parameter, please check the documentation."} (gateway
  *   size cap, not a real param error).
  * - Xiaomi MiMo: Truncates input to fill contextWindow exactly, then returns finish_reason "length"
@@ -39,6 +39,7 @@ import type { AssistantMessage } from "../types.ts";
  */
 const OVERFLOW_PATTERNS = [
 	/prompt (?:is )?too long/i, // Anthropic and z.ai token overflow
+	/prompt exceeds max length/i, // z.ai CN endpoint token overflow
 	/request_too_large/i, // Anthropic request byte-size overflow (HTTP 413)
 	/input is too long for requested model/i, // Amazon Bedrock
 	/exceeds the context window/i, // OpenAI (Completions & Responses API)

@@ -1,205 +1,147 @@
 # @earendil-works/chord
 
-Chord is an application-composition runtime for systems assembled from
-plugins/extensions. It provides facets, services, replicated state, and a
-pluggable remote-service boundary. It is developed as a standalone package in
-the Pi monorepo, but it is not a Pi package: it does not depend on any other Pi
-workspace package and can be used by unrelated applications.
+Chord builds applications out of **objects** that live in several processes (a server, workers, browser tabs) and can be **hot reloaded** while they run.
 
-## What Chord is for
+- An **object** is state plus code at an address. It is created on demand and lives while someone holds it.
+- Everyone gets a **handle**, never the object. Handles work the same locally and across processes, and survive reloads.
+- Every object knows its **principal**: an owner and a guest get different objects, with different methods.
+- **State** is observable JSON. Remote viewers get a snapshot followed by deltas.
+- **Hot reload** swaps code while it runs. Work in flight finishes on the code it started with, state is kept, and incompatible changes migrate at a safe point.
 
-A single application feature may need to run in several environments: for
-example, an agent worker, a terminal UI, and a remote WebUI.  Chord provides the
-generic machinery to write such extensions in a way that is both delightful for
-humans as well as agents.
+Contracts are runtime values described with [TypeBox](https://github.com/sinclairzx81/typebox) schemas. Hosts exchange JSON frames over links: in memory, a Node IPC channel, or a WebSocket.
 
-The design has a few connected pieces:
+## Entry points
 
-- **Plugins** are synchronous setup units that declare the services they provide
-  and require. After every plugin has declared its shape, a host validates the
-  complete dependency graph, binds services, activates providers before consumers,
-  and disposes resources in reverse dependency order.  These units are called
-  *facets*.
+| Import | Contents | Runs in |
+|--------|----------|---------|
+| `@earendil-works/chord` | Contracts (`local`, `remote`, `method`, `opaque`), declarations (`cell`, `derivation`, `listener`, `resource`), hosts (`createHost`, `defineFacet`, `defineRegistry`), links (`memoryLinkPair`, `ipcLink`, `webSocketLink`, `acceptWebSockets`), errors (`ChordError`, `isChordError`, `forbidden`, `invalid`). Also the shared base: `Context`, `JsonValue`, `JsonRepresentation`, `Draft`, `copyJson`, `isJsonValue`, and `replicatedState` with its types. | Node and browsers |
+| `@earendil-works/chord/node` | Child host processes: `createHostManager`, `forkDriver`, `childControl`, `processLock`; the facet module loader `nodeLoader`. | Node |
+| `@earendil-works/chord/context` | Explicit cancellation and invocation values: `BACKGROUND_CONTEXT`, `withCancel`, `withAbortSignal`, `withoutAbortSignal`, `withContextValue`, `awaitWithContext`. | Node and browsers |
+| `@earendil-works/chord/delta` | The transactional JSON tracker, structural diff, immutable apply, and the wire encoder/decoder for operation batches. | Node and browsers |
 
-- **Facets** are parts of a plugin.  Each facet is bundled up separately and runs
-  in the process or environment where it's supposed to run.  You can use facets
-  to split a plugin into separate pieces that need to be loaded into different
-  processes and environments (think backend, browser, TUI etc.)
+## Quick start
 
-- **Services** are typed, stable tokens with either one provider (**singleton**)
-  or dynamic keyed instances (**keyed**).  A service can be process-local, with
-  an unrestricted JavaScript contract, or remotely exposable. Consumers retain a
-  stable facade while a provider disconnects or is replaced.
+```ts
+import { Type } from "typebox";
+import { cell, createHost, method, remote } from "@earendil-works/chord";
 
-- **Replicated state** exposes authoritative state to local and remote
-  connected consumers. Producers mutate the tracked `state` proxy and call
-  `publish(context)`; consumers receive complete immutable values. Chord flushes
-  one decoded operation batch per publication, while each remote client/state
-  stream owns independent path-codec state. Replicas become unready on disconnect
-  or replacement until they are rehydrated.
+// contract.ts: shared by provider and consumers
+export const Counter = remote("demo.counter", {
+	version: 1,
+	input: Type.Object({ name: Type.String() }),
+	variants: {
+		default: {
+			state: { count: Type.Number() },
+			methods: { increment: method(Type.Object({ by: Type.Number() }), Type.Null()) },
+		},
+	},
+});
 
-- **Delta tracking** records and coalesces operations over tracked plain JSON.
-  It preserves common string and array operations, supports durable base
-  batches, and validates untrusted operations as they are applied. Batches
-  guarantee convergence but are not canonical or necessarily minimal.
+const host = createHost({ name: "server", principalKey: (p) => p.kind });
 
-- **Remote service sources** advertise services available outside a facet host
-  and open bindings for the services its facets require. Bindings carry logical
-  calls and subscriptions through an application-supplied adapter. Chord
-  requires strict-JSON arguments, results, snapshots, updates, and catalogues,
-  but does not prescribe framing, routing, transport, or an application wire
-  envelope. `JsonRepresentation<T>` derives a wire-safe type for application data
-  with unknown payloads, while `isJsonValue()` validates received values at an
-  adapter boundary. Symmetric RPC peers are planned as one optional
-  implementation of this boundary.
+host.serve(Counter, ({ name }, _principal, self) => {
+	const state = self.state({ count: cell(Type.Number(), 0) });
+	return {
+		kind: "default",
+		count: state.count,
+		increment: async ({ by }, ctx) => {
+			state.count.change(ctx, (n) => n + by);
+			return null;
+		},
+	};
+});
 
-- **Context** Chord provides a Go-like context system for cancellation and
-  invocation-scoped application values. Applications can carry permissions or
-  telemetry through those values without Chord depending on either.
+await host.root(async (ctx) => {
+	const clicks = ctx.get(Counter, { name: "clicks" }); // a handle; held until this root ends
+	clicks.count.subscribe((n) => console.log("count", n));
+	await clicks.increment({ by: 2 }, ctx); // logs 0, then 2
+});
+```
 
-The current runtime exports service tokens, singleton and keyed providers,
-remote bindings, replicated state, facet hosts, and facet loaders from
-`@earendil-works/chord`. Import public types and general runtime APIs from the
-package root. Context constants and functions live in
-`@earendil-works/chord/context` because their generic names should not pollute
-the root API.
-Chord-owned identifiers use the `chord.*` namespace and its reserved service
-prefix is `$chord.*`.
+## Documentation
 
-## Remote service adapters
-
-Chord owns its transport-independent service wire grammar. Consumer adapters
-use `createServiceCatalogueCall()`, `createServiceSubscribeCall()`, and
-`createServiceUnsubscribeCall()` for `$chord.service` control calls.
-`createRemoteServiceEndpoint()` handles those calls for one provider consumer,
-including subscription activation and cleanup. `parseServiceCall()`,
-`parseServiceCatalogue()`, and the decoded/wire snapshot and update parsers
-validate Chord semantics after an adapter has established a strict-JSON
-boundary. `RemoteServiceErrorCode` and `REMOTE_SERVICE_ERROR_CODES` define the
-service errors that may cross that boundary.
-
-Replicated state operations use one `createServiceStateEncoder()` at the
-provider side and one `createServiceStateDecoder()` at the consumer side for
-each subscription. Those registries create an independent Delta path dictionary
-for every instance/member state and reset it on replacement, unavailability,
-close, or fresh hydration. Applications may place these values inside any
-routing, request, response, or event envelope; Chord does not prescribe that
-outer protocol.
+- [Tutorial](docs/tutorial.md): a shared todo list, built up section by section. Every example runs as `test/tutorial.test.ts`.
+- [Usage guide](docs/guide.md): API reference for contracts, objects, state, roots, lifetime, plugins, hot reload, hosts, and links.
+- [Specification](docs/spec.md): compatibility, lifetime, and reload semantics, plus known limitations and implementation decisions.
+- [Delta guide](src/delta/README.md): ownership, lifecycle, operation, and replica contracts of `@earendil-works/chord/delta`.
 
 ## Tracking JSON deltas
 
-Import the standalone delta primitive from `@earendil-works/chord/delta`:
+Import the standalone transactional tracker from `@earendil-works/chord/delta`:
 
 ```ts
-import { apply, track } from "@earendil-works/chord/delta";
+import { applyImmutable, track } from "@earendil-works/chord/delta";
 
-const changes = track({ output: "", count: 0 });
-changes.flush(); // opening base batch
-changes.state.output += "done\n";
-changes.state.count += 1;
+const tracker = track({ output: "", count: 0 });
+const change = tracker.beginChange();
+change.state.output += "done\n";
+change.state.count += 1;
+const prepared = change.prepare();
 
-const ops = changes.flush();
-const replica = apply({ output: "", count: 0 }, ops);
+tracker.adopt(prepared);
+const replica = applyImmutable(prepared.base, prepared.ops);
 ```
 
-The first flush is always a complete base batch. Later flushes contain path-based
-changes. `applyImmutable()` applies those batches while preserving prior replica
-revisions. `replicatedState(initial)` uses tracking directly:
+`tracker.value` is always the latest adopted immutable revision. Preparation does
+not change authority; adoption validates the preparation and swaps the root pointer.
+Assigned containers are copied by value and unchanged subtrees may be shared between
+revisions.
+
+The tracker uses trusted immutable ownership rather than defensive copying or
+freezing. `track(initial)`, `prepareReplace(value)`, `replicatedState(initial)`, and
+`replace(context, value)` take ownership of alias-free strict-JSON roots without
+walking them. Callers must not mutate transferred or published data. Values placed
+through drafts are already copied, so that walk also rejects non-strict JSON before
+the draft changes. Published values are not frozen. In-process consumers may share
+their containers with the provider; mutating a consumed value violates the contract
+and can corrupt authority. Clone or serialize at any mutable trust boundary.
+
+Replicated state provides the same model through a callback. `replicatedState` is a
+standalone observable value, independent of hosts; Durable uses it for document,
+view, and task-graph states:
 
 ```ts
-const status = env.replicatedState({ output: "", count: 0 });
-status.state.output += "done\n";
-status.state.count += 1;
-status.publish(context);
-```
+import { replicatedState } from "@earendil-works/chord";
 
-`publish()` flushes once; remote connection plumbing encodes that operation batch
-independently for every client/state pairing. String assignments preserve pure
-appends and rolling-window movement as append and front-truncate operations;
-unrelated rewrites fall back to a set. Values inserted into tracked state become
-tracker-owned and must subsequently be mutated only through `state`. See the
-[Delta guide](src/delta/README.md) for mutation, array, lifecycle, and
-consumer-ownership rules.
-
-## Bundling and loading facets
-
-`@earendil-works/chord/bundler` uses esbuild to turn ESM or TypeScript application
-entries into independent, content-addressed CommonJS files. The package-level API
-reads plugin identity and build configuration from `package.json`, then applies
-facet path conventions supplied by the host application:
-
-```json
-{
-  "name": "@example/my-plugin",
-  "version": "1.0.0",
-  "type": "module",
-  "peerDependencies": {
-    "@earendil-works/chord": "^0.84.4"
-  },
-  "chord": {
-    "facets": {
-      "worker": "./src/custom-worker.ts",
-      "presentation": false
-    }
-  }
-}
-```
-
-```ts
-import { bundleFacetPackage } from "@earendil-works/chord/bundler";
-
-await bundleFacetPackage({
-	packagePath: "/path/to/my-plugin",
-	outdir: "/application-owned/plugin-builds/my-plugin",
-	defaultFacets: {
-		worker: "src/worker.ts",
-		presentation: "src/presentation.ts",
-	},
+const initial = { output: "", count: 0 };
+const status = replicatedState(initial); // transfers ownership of initial
+status.change(context, (draft) => {
+	draft.output += "done\n";
+	draft.count += 1;
 });
 ```
 
-Existing conventional files become entries unless `chord.facets` overrides or
-disables them. Peer dependencies are externalized and resolved against the host
-when loading. Chord never installs dependencies or runs package lifecycle
-scripts. `bundleFacets()` remains available as the lower-level API for callers
-that already have explicit plugin identity and entry mappings.
+A successful `change()` publishes exactly one atomic revision. If its callback
+throws, the original value and sequence remain unchanged. Draft handles become
+unusable when the callback returns. The tracker emits string append and
+front-truncate operations, array splices and permutations, sets, and deletes; large
+edit sets may fold into a complete replacement.
 
-The output directory contains one `.cjs` file per entry plus
-`chord-facets.json`. Load one application-selected entry through the Node-only
-loader:
+`replicatedState(source, { onError })` instead attaches a publication-only state to
+an authoritative revision source (`ReplicatedStateSource`): it captures a snapshot,
+then publishes every committed frame in cursor order.
 
-```ts
-import { createFacetBundleLoader } from "@earendil-works/chord/node";
+### Public state subscriptions
 
-const loader = createFacetBundleLoader({
-	manifestPath: "/application-owned/plugin-builds/my-plugin/chord-facets.json",
-	entry: "worker",
-	resolveExternal: (specifier) => import.meta.resolve(specifier),
-});
-const loaded = await loader.load();
-```
+`state.subscribe(async (value, context, delivery) => { ... })` serializes callbacks
+independently for each subscription. Hydration starts immediately when a value is
+available, and its returned promise must settle before updates start. Synchronous
+callbacks still run synchronously. Read the captured `value` inside an asynchronous
+callback: `state.value` may already refer to a later revision.
 
-Each `load()` verifies SHA-256 integrity and compiles the CommonJS body directly
-with `node:vm` instead of putting the plugin into Node's CommonJS or ESM module
-cache. Externals are resolved by the host and loaded through a restricted
-`require`; esbuild lowers dynamic imports so they use the same path. Disposing a
-retired generation releases the loader's facet references, making its compiled
-code eligible for garbage collection once plugin-owned resources are also gone.
+Each subscription retains at most 100 pending complete-value deliveries, excluding
+the running callback. On overflow, only the newest pending value, context, and
+delivery metadata are retained; a not-yet-started initial hydration is preserved.
+Thus public delivery sequences may skip. This is a frame-count policy, not a byte
+limit.
 
-For transport to another Node host, `readFacetBundleArtifact()` packages one
-verified manifest entry with its source, and `createFacetBundleArtifactLoader()`
-materializes fresh temporary generations while resolving externals against the
-receiving host.
+The returned unsubscribe function immediately discards pending work and prevents
+new callbacks. It neither aborts nor waits for the running callback. Synchronous
+throws and promise rejections are observed, reported, and do not stop other
+subscriptions or subsequent callbacks. Attached sources use their `onError`
+handler; mutable states (and attached sources without a handler) report failures
+by throwing in a microtask. Unsubscribing does not hide a later rejection from the
+running callback.
 
-To reload, load a candidate, pass its facets to `FacetHost.reload()`, dispose the
-candidate on failure, and dispose the retired `LoadedFacets` only after a
-successful cutover. The host activates and validates the candidate while the
-currently active providers remain routed, then replaces each singleton directly
-without an unavailable interval. Stable service handles therefore do not become
-disconnected during an ordinary reload. Keyed instances
-remain incarnation-specific and replacements receive fresh generations. The
-bundler writes a complete temporary directory before replacing the previous
-output, so loaders do not observe partially built generations.
-
-See [PLANNING.md](PLANNING.md) for the broader RPC and generation-loading
-architecture.
+Cells of Chord objects and their remote readables have their own subscription
+model; see [State](docs/guide.md#state) in the usage guide.

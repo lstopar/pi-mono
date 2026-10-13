@@ -6,6 +6,7 @@ import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../../utils/ansi.ts";
 import { resolvePath } from "../../utils/paths.ts";
 import { sanitizeBinaryOutput } from "../../utils/shell.ts";
+import type { ToolRenderContext } from "../extensions/types.ts";
 
 export function shortenPath(path: unknown): string {
 	if (typeof path !== "string") return "";
@@ -67,6 +68,87 @@ export type ToolRenderResultLike<TDetails> = {
 	content: (TextContent | ImageContent)[];
 	details: TDetails;
 };
+
+const COLLAPSED_ARGS_CHARS = 100;
+
+/**
+ * Generic tool call header: the title followed by the arguments. Collapsed, they are `key=value`
+ * pairs on the title line, cut to {@link COLLAPSED_ARGS_CHARS}. Expanded, each is a `key: value`
+ * line below the title, with strings shown raw and continuation lines indented.
+ */
+export function formatToolCallWithArgs(title: string, args: unknown, theme: Theme, expanded: boolean): string {
+	const header = theme.fg("toolTitle", theme.bold(title));
+	if (args == null) return header;
+	const entries =
+		typeof args === "object" && !Array.isArray(args)
+			? Object.entries(args)
+			: ([["args", args]] as [string, unknown][]);
+	if (entries.length === 0) return header;
+	if (expanded) {
+		const lines = entries.map(([key, value]) => {
+			const text = typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? String(value));
+			return `  ${key}: ${replaceTabs(text).replace(/\r/g, "").split("\n").join("\n    ")}`;
+		});
+		return `${header}\n${theme.fg("muted", lines.join("\n"))}`;
+	}
+	const pairs = entries.map(([key, value]) => `${key}=${JSON.stringify(value) ?? String(value)}`).join(" ");
+	const preview = pairs.length > COLLAPSED_ARGS_CHARS ? `${pairs.slice(0, COLLAPSED_ARGS_CHARS - 3)}...` : pairs;
+	return `${header} ${theme.fg("muted", preview)}`;
+}
+
+/** Duration as `4.2s` below a minute, then `1m 30s` and `2h 3m 4s`. */
+export function formatToolDuration(ms: number): string {
+	const seconds = ms / 1000;
+	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+
+	const totalSeconds = Math.floor(seconds);
+	const minutes = Math.floor(totalSeconds / 60);
+	const remainder = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${remainder}s`;
+
+	return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${remainder}s`;
+}
+
+/** Renderer state of {@link startToolTimer} and {@link toolTimerText}, kept in `ToolRenderContext.state`. */
+interface ToolTimerState {
+	startedAt?: number;
+	endedAt?: number;
+	interval?: ReturnType<typeof setInterval>;
+}
+
+/** Start the row's clock once execution starts. Call from `renderCall`. */
+export function startToolTimer(context: ToolRenderContext<ToolTimerState>): void {
+	const state = context.state;
+	if (context.executionStarted && state.startedAt === undefined) {
+		state.startedAt = Date.now();
+		state.endedAt = undefined;
+	}
+}
+
+/**
+ * The row's timing line, from `renderResult`: `Elapsed 4.2s` while the result is partial, redrawn
+ * every second, and `Took 4.2s` once it is final. Undefined when the row has no start time and no
+ * recorded duration.
+ */
+export function toolTimerText(context: ToolRenderContext<ToolTimerState>, isPartial: boolean): string | undefined {
+	const state = context.state;
+	if (state.startedAt !== undefined && isPartial && !state.interval) {
+		state.interval = setInterval(() => context.invalidate(), 1000);
+	}
+	if (!isPartial || context.isError) {
+		state.endedAt ??= Date.now();
+		if (state.interval) {
+			clearInterval(state.interval);
+			state.interval = undefined;
+		}
+	}
+	// A final result's recorded duration wins: it is monotonic and survives reloads. The renderer's own clock is the
+	// fallback for live progress and for results stored without one.
+	if (!isPartial && context.durationMs !== undefined) return `Took ${formatToolDuration(context.durationMs)}`;
+	if (state.startedAt === undefined) return undefined;
+	const endTime = state.endedAt ?? Date.now();
+	return `${isPartial ? "Elapsed" : "Took"} ${formatToolDuration(endTime - state.startedAt)}`;
+}
 
 export function invalidArgText(theme: Theme): string {
 	return theme.fg("error", "[invalid arg]");

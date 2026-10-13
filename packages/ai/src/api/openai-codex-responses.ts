@@ -215,7 +215,7 @@ function loadNodeZlib(): typeof NodeZlib | null {
 // Returns the zstd-compressed body bytes, or null when compression is
 // unavailable (browser/Vite builds). Callers fall back to sending the
 // uncompressed JSON when this returns null.
-function compressRequestBodyZstd(bodyJson: string): Uint8Array | null {
+function compressRequestBodyZstd(bodyJson: string): Uint8Array<ArrayBuffer> | null {
 	const zlib = loadNodeZlib();
 	if (!zlib || typeof zlib.zstdCompressSync !== "function") {
 		return null;
@@ -224,7 +224,8 @@ function compressRequestBodyZstd(bodyJson: string): Uint8Array | null {
 		const compressed = zlib.zstdCompressSync(bodyJson, {
 			params: { [zlib.constants.ZSTD_c_compressionLevel]: REQUEST_COMPRESSION_ZSTD_LEVEL },
 		});
-		return new Uint8Array(compressed.buffer, compressed.byteOffset, compressed.byteLength);
+		// A copy owns a plain ArrayBuffer, which fetch accepts as a body under every lib.
+		return new Uint8Array(compressed);
 	} catch {
 		return null;
 	}
@@ -380,7 +381,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			if (compressedBody) {
 				sseHeaders.set("content-encoding", "zstd");
 			}
-			const sseBody: Uint8Array | string = compressedBody ?? bodyJson;
+			const sseBody: Uint8Array<ArrayBuffer> | string = compressedBody ?? bodyJson;
 
 			// Fetch with retry logic for rate limits and transient errors
 			let response: Response | undefined;
@@ -665,12 +666,18 @@ async function processStream(
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal), output), output, stream, model, {
-		serviceTier: options?.serviceTier,
-		grammarToolInputProperties,
-		resolveServiceTier: resolveCodexServiceTier,
-		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
-	});
+	await processResponsesStream(
+		mapCodexEvents(parseSSE(response, options?.signal), output, model, options?.onProviderStreamEvent),
+		output,
+		stream,
+		model,
+		{
+			serviceTier: options?.serviceTier,
+			grammarToolInputProperties,
+			resolveServiceTier: resolveCodexServiceTier,
+			applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+		},
+	);
 }
 
 class CodexApiError extends Error {
@@ -697,8 +704,20 @@ class CodexProtocolError extends Error {
 	}
 }
 
+class ProviderStreamEventCallbackError extends Error {
+	constructor(cause: unknown) {
+		super(formatThrownValue(cause));
+		this.name = "ProviderStreamEventCallbackError";
+		this.cause = cause;
+	}
+}
+
 function isCodexNonTransportError(error: unknown): boolean {
-	return error instanceof CodexApiError || error instanceof CodexProtocolError;
+	return (
+		error instanceof CodexApiError ||
+		error instanceof CodexProtocolError ||
+		error instanceof ProviderStreamEventCallbackError
+	);
 }
 
 function isWebSocketConnectionLimitReachedError(error: unknown): boolean {
@@ -725,8 +744,16 @@ function extractCodexEventError(event: Record<string, unknown>): { code?: string
 async function* mapCodexEvents(
 	events: AsyncIterable<Record<string, unknown>>,
 	output: AssistantMessage,
+	model: Model<"openai-codex-responses">,
+	onProviderStreamEvent: StreamOptions["onProviderStreamEvent"] | undefined,
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
+		try {
+			await onProviderStreamEvent?.(event, model);
+		} catch (error) {
+			// Keep callback failures out of Codex's WebSocket retry and SSE fallback path.
+			throw new ProviderStreamEventCallbackError(error);
+		}
 		const type = typeof event.type === "string" ? event.type : undefined;
 		if (!type) continue;
 
@@ -1516,7 +1543,12 @@ async function processWebSocketStream(
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
-				mapCodexEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs), output),
+				mapCodexEvents(
+					parseWebSocket(socket, options?.signal, idleTimeoutMs),
+					output,
+					model,
+					options?.onProviderStreamEvent,
+				),
 				onStart,
 			),
 			output,
@@ -1612,7 +1644,11 @@ function buildBaseCodexHeaders(
 	accountId: string,
 	token: string,
 ): Headers {
-	const headers = new Headers(initHeaders);
+	// Defaults first so model and caller headers can override them, matching the other providers.
+	const headers = new Headers({ originator: "pi", "User-Agent": getPiUserAgent() });
+	for (const [key, value] of Object.entries(initHeaders || {})) {
+		headers.set(key, value);
+	}
 	for (const [key, value] of Object.entries(additionalHeaders || {})) {
 		if (value === null) {
 			headers.delete(key);
@@ -1622,8 +1658,6 @@ function buildBaseCodexHeaders(
 	}
 	headers.set("Authorization", `Bearer ${token}`);
 	headers.set("chatgpt-account-id", accountId);
-	headers.set("originator", "pi");
-	headers.set("User-Agent", getPiUserAgent());
 	return headers;
 }
 
